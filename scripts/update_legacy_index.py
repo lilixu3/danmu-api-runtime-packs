@@ -39,14 +39,18 @@ def update_legacy_index(
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
         raise PackBuildError("旧版兼容 entry 缺少有效依赖指纹")
 
-    legacy_entry = dict(entry)
-    legacy_entry.pop("channel", None)
-    legacy_entry.pop("coreBranch", None)
     short_sha = core_sha[:12]
-    legacy_entry["artifactUrl"] = (
+    expected_url = (
         f"https://github.com/{PACK_REPO}/releases/download/"
         f"core-{short_sha}/runtime-pack-{short_sha}.zip"
     )
+    if entry.get("artifactUrl") != expected_url:
+        raise PackBuildError("旧版兼容索引必须使用独立 schema-1 依赖包")
+
+    legacy_entry = dict(entry)
+    legacy_entry.pop("channel", None)
+    legacy_entry.pop("coreBranch", None)
+    legacy_entry["artifactUrl"] = expected_url
 
     current = read_json(index_path) if index_path.exists() else {
         "schema": 1,

@@ -17,7 +17,9 @@ branch values come from its hard-coded allowlist. Arbitrary custom repositories
 are never cloned or packaged by the signing pipeline.
 
 The root `index.json` and `index.sig` remain a schema-1 **stable compatibility
-index** for older App versions. Development packs never enter that legacy index.
+index** for older App versions. Stable schema-2 output is converted into a distinct
+schema-1 manifest/ZIP and all archive and manifest hashes are recomputed before that
+legacy index is signed. Development packs never enter the legacy index.
 
 ## Channel isolation
 

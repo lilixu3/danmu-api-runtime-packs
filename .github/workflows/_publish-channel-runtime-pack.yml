@@ -140,6 +140,16 @@ jobs:
             --arg sha "$CORE_SHA" \
             '(.channel == $channel) and (.coreRepo == $repo) and (.coreBranch == $branch) and (.coreSha == $sha) and (.artifactSha256 | test("^[0-9a-f]{64}$"))' \
             dist/entry.json >/dev/null
+          if [[ "$CHANNEL" == "stable" ]]; then
+            python3 -m scripts.build_legacy_compat_pack \
+              --channel-entry dist/entry.json \
+              --channel-archive "dist/runtime-pack-stable-${SHORT_SHA}.zip" \
+              --output-dir dist >/dev/null
+            jq -e \
+              --arg sha "$CORE_SHA" \
+              '(.channel == "stable") and (.coreRepo == "huangxd-/danmu_api") and (.coreBranch == "main") and (.coreSha == $sha) and (.artifactUrl | contains("/core-"))' \
+              dist/legacy-entry.json >/dev/null
+          fi
 
       - name: Upload verified build output
         if: steps.source.outputs.exists != 'true'
@@ -201,9 +211,8 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          source_asset="dist/runtime-pack-stable-${SHORT_SHA}.zip"
           legacy_asset="dist/runtime-pack-${SHORT_SHA}.zip"
-          cp "$source_asset" "$legacy_asset"
+          test -f "$legacy_asset"
           tag="core-${SHORT_SHA}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release upload "$tag" "$legacy_asset" --repo "$GITHUB_REPOSITORY" --clobber
@@ -232,7 +241,7 @@ jobs:
           if [[ "$CHANNEL" == "stable" ]]; then
             python3 -m scripts.update_legacy_index \
               --index index.json \
-              --entry dist/entry.json \
+              --entry dist/legacy-entry.json \
               --replace > /dev/null
           fi
 

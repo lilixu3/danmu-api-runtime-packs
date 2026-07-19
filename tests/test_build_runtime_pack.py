@@ -2,6 +2,7 @@ import hashlib
 import json
 import tempfile
 import unittest
+import zipfile
 from pathlib import Path
 
 from scripts.build_runtime_pack import (
@@ -10,6 +11,7 @@ from scripts.build_runtime_pack import (
     TRUSTED_CHANNELS,
     PackBuildError,
     UPSTREAM_CORE_REPO,
+    _zip_deterministic,
     build_manifest,
     canonical_json_bytes,
     collect_package_records,
@@ -17,11 +19,13 @@ from scripts.build_runtime_pack import (
     filter_android_dependencies,
     merge_index_entry,
     new_channel_index,
+    sha256_file,
     source_dependencies,
     trusted_channel,
     validate_channel_source,
     validate_package_tree,
 )
+from scripts.build_legacy_compat_pack import build_legacy_compat_pack
 from scripts.update_legacy_index import update_legacy_index
 
 
@@ -320,7 +324,92 @@ class BuildRuntimePackTest(unittest.TestCase):
             manifest,
             json.loads(canonical_json_bytes(manifest).decode("utf-8")),
         )
-    def test_legacy_index_accepts_only_stable_channel(self):
+
+    def test_builds_distinct_schema_one_legacy_pack_with_recomputed_hashes(self):
+        sha = "a" * 40
+        fingerprint = "b" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            channel_root = root / "channel"
+            package_file = channel_root / "node_modules/pure-package/index.js"
+            package_file.parent.mkdir(parents=True)
+            package_payload = b"export const ready = true;\n"
+            package_file.write_bytes(package_payload)
+            (channel_root / "runtime-lock.json").write_text("{}", encoding="utf-8")
+            manifest = {
+                "schema": 2,
+                "channel": "stable",
+                "coreRepo": UPSTREAM_CORE_REPO,
+                "coreBranch": "main",
+                "coreSha": sha,
+                "coreVersion": "1.0.0",
+                "runtimeProtocol": 1,
+                "nodeMajor": 18,
+                "dependencyFingerprint": fingerprint,
+                "packages": [],
+                "files": [
+                    {
+                        "path": "node_modules/pure-package/index.js",
+                        "size": len(package_payload),
+                        "sha256": hashlib.sha256(package_payload).hexdigest(),
+                    }
+                ],
+            }
+            manifest_bytes = canonical_json_bytes(manifest)
+            (channel_root / "manifest.json").write_bytes(manifest_bytes)
+            channel_archive = root / f"runtime-pack-stable-{sha[:12]}.zip"
+            _zip_deterministic(channel_root, channel_archive)
+            channel_entry = {
+                "channel": "stable",
+                "coreRepo": UPSTREAM_CORE_REPO,
+                "coreBranch": "main",
+                "coreSha": sha,
+                "coreVersion": "1.0.0",
+                "runtimeProtocol": 1,
+                "dependencyFingerprint": fingerprint,
+                "artifactUrl": "https://example.invalid/stable.zip",
+                "artifactSha256": sha256_file(channel_archive),
+                "artifactSize": channel_archive.stat().st_size,
+                "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
+                "packages": [],
+            }
+            entry_path = root / "entry.json"
+            entry_path.write_text(json.dumps(channel_entry), encoding="utf-8")
+            output = root / "dist"
+
+            legacy_entry = build_legacy_compat_pack(
+                channel_entry_path=entry_path,
+                channel_archive_path=channel_archive,
+                output_dir=output,
+            )
+            legacy_archive = output / f"runtime-pack-{sha[:12]}.zip"
+            with zipfile.ZipFile(legacy_archive) as archive:
+                legacy_manifest_bytes = archive.read("manifest.json")
+                legacy_manifest = json.loads(legacy_manifest_bytes)
+            with zipfile.ZipFile(channel_archive) as archive:
+                self.assertEqual(2, json.loads(archive.read("manifest.json"))["schema"])
+
+            self.assertEqual(1, legacy_manifest["schema"])
+            self.assertNotIn("channel", legacy_manifest)
+            self.assertNotIn("coreBranch", legacy_manifest)
+            self.assertNotEqual(channel_entry["artifactSha256"], legacy_entry["artifactSha256"])
+            self.assertEqual(sha256_file(legacy_archive), legacy_entry["artifactSha256"])
+            self.assertEqual(legacy_archive.stat().st_size, legacy_entry["artifactSize"])
+            self.assertEqual(
+                hashlib.sha256(legacy_manifest_bytes).hexdigest(),
+                legacy_entry["manifestSha256"],
+            )
+            self.assertEqual(
+                "https://github.com/lilixu3/danmu-api-runtime-packs/"
+                f"releases/download/core-{sha[:12]}/runtime-pack-{sha[:12]}.zip",
+                legacy_entry["artifactUrl"],
+            )
+            legacy_index = update_legacy_index(
+                root / "index.json", output / "legacy-entry.json"
+            )
+            self.assertEqual(legacy_entry["artifactSha256"], legacy_index["entries"][sha]["artifactSha256"])
+
+    def test_legacy_index_rejects_channel_zip_and_dev_entry(self):
         sha = "a" * 40
         fingerprint = "b" * 64
         with tempfile.TemporaryDirectory() as tmp:
@@ -339,15 +428,8 @@ class BuildRuntimePackTest(unittest.TestCase):
                 ),
                 encoding="utf-8",
             )
-            legacy = update_legacy_index(root / "index.json", stable_entry_path)
-            entry = legacy["entries"][sha]
-            self.assertNotIn("channel", entry)
-            self.assertNotIn("coreBranch", entry)
-            self.assertEqual(
-                "https://github.com/lilixu3/danmu-api-runtime-packs/"
-                f"releases/download/core-{sha[:12]}/runtime-pack-{sha[:12]}.zip",
-                entry["artifactUrl"],
-            )
+            with self.assertRaises(PackBuildError):
+                update_legacy_index(root / "index.json", stable_entry_path)
 
             dev_entry_path = root / "dev-entry.json"
             dev_entry_path.write_text(
