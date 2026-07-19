@@ -11,6 +11,9 @@ on:
   schedule:
     - cron: "47 */2 * * *"
 
+permissions:
+  contents: write
+
 jobs:
   publish:
     uses: ./.github/workflows/_publish-channel-runtime-pack.yml
