@@ -14,6 +14,7 @@ from scripts.build_runtime_pack import (
     dependency_fingerprint,
     filter_android_dependencies,
     merge_index_entry,
+    source_dependencies,
     validate_package_tree,
 )
 
@@ -44,6 +45,35 @@ class BuildRuntimePackTest(unittest.TestCase):
             {"brotli": "^1.3.3"},
             filter_android_dependencies(package_json, policy),
         )
+
+    def test_rejects_non_registry_dependency_specs(self):
+        bad_specs = (
+            "git+https://github.com/example/pkg.git",
+            "https://example.com/pkg.tgz",
+            "file:../pkg",
+            "workspace:*",
+            "../local-package",
+        )
+        for spec in bad_specs:
+            with self.subTest(spec=spec), self.assertRaises(PackBuildError):
+                source_dependencies({"dependencies": {"unsafe-package": spec}})
+        self.assertEqual(
+            {"safe-package": "^1.2.3 || ~2.0.0"},
+            source_dependencies({"dependencies": {"safe-package": "^1.2.3 || ~2.0.0"}}),
+        )
+
+    def test_rejects_libc_limited_packages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "node_modules" / "platform-package"
+            root.mkdir(parents=True)
+            (root / "package.json").write_text(
+                json.dumps(
+                    {"name": "platform-package", "version": "1.0.0", "libc": ["glibc"]}
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(PackBuildError):
+                validate_package_tree(Path(tmp) / "node_modules")
 
     def test_dependency_fingerprint_is_order_independent(self):
         left = {"brotli": "^1.3.3", "pako": "2.1.0"}

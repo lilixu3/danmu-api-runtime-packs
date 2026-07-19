@@ -71,6 +71,23 @@ def dependency_fingerprint(dependencies: dict[str, str]) -> str:
     return sha256_bytes(canonical_json_bytes(dict(sorted(dependencies.items()))))
 
 
+def _validate_registry_dependency_spec(name: str, spec: str) -> None:
+    normalized = spec.strip()
+    lowered = normalized.lower()
+    non_registry_prefix = re.compile(
+        r"^(?:git(?:\+[a-z0-9]+)?|https?|ssh|file|link|workspace|npm|github|gitlab|bitbucket):"
+    )
+    github_shorthand = re.compile(r"^[a-z0-9_.-]+/[a-z0-9_.-]+(?:#.*)?$", re.IGNORECASE)
+    if (
+        not normalized
+        or normalized.startswith((".", "/"))
+        or "://" in lowered
+        or non_registry_prefix.match(lowered)
+        or github_shorthand.fullmatch(normalized)
+    ):
+        raise PackBuildError(f"拒绝非公开 npm registry 依赖：{name}@{spec}")
+
+
 def source_dependencies(package_json: dict[str, Any]) -> dict[str, str]:
     """Merge npm dependency declarations in the same precedence order npm uses."""
 
@@ -81,7 +98,10 @@ def source_dependencies(package_json: dict[str, Any]) -> dict[str, str]:
             raise PackBuildError(f"核心 package.json 的 {field} 不是对象")
         for name, spec in values.items():
             if isinstance(name, str) and isinstance(spec, str) and name.strip() and spec.strip():
-                merged[name.strip()] = spec.strip()
+                normalized_name = name.strip()
+                normalized_spec = spec.strip()
+                _validate_registry_dependency_spec(normalized_name, normalized_spec)
+                merged[normalized_name] = normalized_spec
     return dict(sorted(merged.items()))
 
 
@@ -167,7 +187,7 @@ def validate_package_tree(node_modules_dir: Path) -> list[dict[str, Any]]:
             raise PackBuildError(
                 f"拒绝包含安装脚本的包：{package_name}（{', '.join(bad_scripts)}）"
             )
-        if package_json.get("os") or package_json.get("cpu"):
+        if package_json.get("os") or package_json.get("cpu") or package_json.get("libc"):
             raise PackBuildError(f"拒绝带平台限定的包：{package_name}")
         for file_path, _ in _iter_runtime_files(package_root):
             if file_path.suffix.lower() in _NATIVE_SUFFIXES or file_path.name in _NATIVE_FILENAMES:
