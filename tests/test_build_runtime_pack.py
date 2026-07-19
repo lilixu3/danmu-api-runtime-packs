@@ -76,9 +76,13 @@ class BuildRuntimePackTest(unittest.TestCase):
                 validate_package_tree(Path(tmp) / "node_modules")
 
     def test_dependency_fingerprint_is_order_independent(self):
-        left = {"brotli": "^1.3.3", "pako": "2.1.0"}
-        right = {"pako": "2.1.0", "brotli": "^1.3.3"}
+        left = {"brotli": "^1.3.3", "pako": "^2.1.0"}
+        right = {"pako": "^2.1.0", "brotli": "^1.3.3"}
         self.assertEqual(dependency_fingerprint(left), dependency_fingerprint(right))
+        self.assertEqual(
+            "546a071745a850d49ec26f4b27dc7591d018e75e3d6cc45ede7d3cb9c604b0ff",
+            dependency_fingerprint(left),
+        )
         self.assertEqual(
             64,
             len(dependency_fingerprint(left)),
