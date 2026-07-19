@@ -6,6 +6,8 @@ from pathlib import Path
 
 from scripts.build_runtime_pack import (
     EMBEDDED_NODE_MAJOR,
+    INDEX_SCHEMA,
+    TRUSTED_CHANNELS,
     PackBuildError,
     UPSTREAM_CORE_REPO,
     build_manifest,
@@ -14,14 +16,40 @@ from scripts.build_runtime_pack import (
     dependency_fingerprint,
     filter_android_dependencies,
     merge_index_entry,
+    new_channel_index,
     source_dependencies,
+    trusted_channel,
+    validate_channel_source,
     validate_package_tree,
 )
+from scripts.update_legacy_index import update_legacy_index
 
 
 class BuildRuntimePackTest(unittest.TestCase):
-    def test_uses_the_official_upstream_core_repository(self):
+    def test_uses_only_the_stable_and_dev_core_repositories(self):
         self.assertEqual(UPSTREAM_CORE_REPO, "huangxd-/danmu_api")
+        self.assertEqual(
+            TRUSTED_CHANNELS,
+            {
+                "stable": {
+                    "repo": "huangxd-/danmu_api",
+                    "branch": "main",
+                    "url": "https://github.com/huangxd-/danmu_api.git",
+                },
+                "dev": {
+                    "repo": "lilixu3/danmu_api",
+                    "branch": "main",
+                    "url": "https://github.com/lilixu3/danmu_api.git",
+                },
+            },
+        )
+        self.assertEqual("lilixu3/danmu_api", trusted_channel("DEV")["repo"])
+        with self.assertRaises(PackBuildError):
+            trusted_channel("custom")
+        with self.assertRaises(PackBuildError):
+            validate_channel_source("dev", "huangxd-/danmu_api", "main")
+        with self.assertRaises(PackBuildError):
+            validate_channel_source("stable", "huangxd-/danmu_api", "test")
 
     def test_filters_only_explicit_non_android_dependencies(self):
         package_json = {
@@ -149,44 +177,81 @@ class BuildRuntimePackTest(unittest.TestCase):
         )
         self.assertEqual("sha512-brotli", records[1]["integrity"])
 
-    def test_merge_index_rejects_non_upstream_entry(self):
+    def test_merge_index_rejects_cross_channel_entry(self):
+        sha = "a" * 40
+        fingerprint = "b" * 64
+        dev_entry = {
+            "channel": "dev",
+            "coreRepo": "lilixu3/danmu_api",
+            "coreBranch": "main",
+            "coreSha": sha,
+            "dependencyFingerprint": fingerprint,
+        }
         with self.assertRaises(PackBuildError):
             merge_index_entry(
-                {"schema": 1, "entries": {}},
-                {"coreRepo": "lilixu3/danmu_api", "coreSha": "abc"},
+                new_channel_index("stable"),
+                dev_entry,
+                channel="stable",
             )
+
+    def test_same_fingerprint_stays_separate_between_channels(self):
+        sha = "a" * 40
+        fingerprint = "b" * 64
+        stable_entry = {
+            "channel": "stable",
+            "coreRepo": "huangxd-/danmu_api",
+            "coreBranch": "main",
+            "coreSha": sha,
+            "dependencyFingerprint": fingerprint,
+        }
+        dev_entry = {
+            "channel": "dev",
+            "coreRepo": "lilixu3/danmu_api",
+            "coreBranch": "main",
+            "coreSha": sha,
+            "dependencyFingerprint": fingerprint,
+        }
+        stable = merge_index_entry(
+            new_channel_index("stable"), stable_entry, channel="stable"
+        )
+        dev = merge_index_entry(new_channel_index("dev"), dev_entry, channel="dev")
+        self.assertEqual(stable_entry, stable["entries"][sha])
+        self.assertEqual(dev_entry, dev["entries"][sha])
+        self.assertEqual("stable", stable["channel"])
+        self.assertEqual("dev", dev["channel"])
 
     def test_merge_index_replaces_existing_entry_only_when_explicitly_forced(self):
         sha = "a" * 40
         fingerprint = "b" * 64
         old = {
+            "channel": "stable",
             "coreRepo": UPSTREAM_CORE_REPO,
+            "coreBranch": "main",
             "coreSha": sha,
             "dependencyFingerprint": fingerprint,
             "artifactSha256": "1" * 64,
         }
-        new = {
-            "coreRepo": UPSTREAM_CORE_REPO,
-            "coreSha": sha,
-            "dependencyFingerprint": fingerprint,
-            "artifactSha256": "2" * 64,
-        }
-        index = {
-            "schema": 1,
-            "upstream": {"repo": UPSTREAM_CORE_REPO, "branch": "main"},
-            "entries": {sha: old},
-        }
+        new = {**old, "artifactSha256": "2" * 64}
+        index = merge_index_entry(
+            new_channel_index("stable"), old, channel="stable"
+        )
         with self.assertRaises(PackBuildError):
-            merge_index_entry(index, new)
-        result = merge_index_entry(index, new, replace=True)
+            merge_index_entry(index, new, channel="stable")
+        result = merge_index_entry(index, new, channel="stable", replace=True)
         self.assertEqual(new, result["entries"][sha])
         self.assertEqual(sha, result["dependencyEntries"][fingerprint])
 
     def test_merge_index_rejects_entry_without_dependency_fingerprint(self):
         with self.assertRaises(PackBuildError):
             merge_index_entry(
-                {"schema": 1, "entries": {}},
-                {"coreRepo": UPSTREAM_CORE_REPO, "coreSha": "a" * 40},
+                new_channel_index("stable"),
+                {
+                    "channel": "stable",
+                    "coreRepo": UPSTREAM_CORE_REPO,
+                    "coreBranch": "main",
+                    "coreSha": "a" * 40,
+                },
+                channel="stable",
             )
 
     def test_ignores_package_internal_subpath_package_json(self):
@@ -224,7 +289,9 @@ class BuildRuntimePackTest(unittest.TestCase):
                 encoding="utf-8",
             )
             manifest = build_manifest(
+                channel="stable",
                 core_repo=UPSTREAM_CORE_REPO,
+                core_branch="main",
                 core_sha="a" * 40,
                 core_version="1.19.16",
                 dependency_fingerprint="b" * 64,
@@ -237,7 +304,10 @@ class BuildRuntimePackTest(unittest.TestCase):
                     }
                 ],
             )
+        self.assertEqual(INDEX_SCHEMA, manifest["schema"])
+        self.assertEqual("stable", manifest["channel"])
         self.assertEqual(UPSTREAM_CORE_REPO, manifest["coreRepo"])
+        self.assertEqual("main", manifest["coreBranch"])
         self.assertEqual(18, EMBEDDED_NODE_MAJOR)
         self.assertEqual(EMBEDDED_NODE_MAJOR, manifest["nodeMajor"])
         paths = {item["path"]: item for item in manifest["files"]}
@@ -250,6 +320,50 @@ class BuildRuntimePackTest(unittest.TestCase):
             manifest,
             json.loads(canonical_json_bytes(manifest).decode("utf-8")),
         )
+    def test_legacy_index_accepts_only_stable_channel(self):
+        sha = "a" * 40
+        fingerprint = "b" * 64
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            stable_entry_path = root / "stable-entry.json"
+            stable_entry_path.write_text(
+                json.dumps(
+                    {
+                        "channel": "stable",
+                        "coreRepo": UPSTREAM_CORE_REPO,
+                        "coreBranch": "main",
+                        "coreSha": sha,
+                        "dependencyFingerprint": fingerprint,
+                        "artifactUrl": "https://example.invalid/stable.zip",
+                    }
+                ),
+                encoding="utf-8",
+            )
+            legacy = update_legacy_index(root / "index.json", stable_entry_path)
+            entry = legacy["entries"][sha]
+            self.assertNotIn("channel", entry)
+            self.assertNotIn("coreBranch", entry)
+            self.assertEqual(
+                "https://github.com/lilixu3/danmu-api-runtime-packs/"
+                f"releases/download/core-{sha[:12]}/runtime-pack-{sha[:12]}.zip",
+                entry["artifactUrl"],
+            )
+
+            dev_entry_path = root / "dev-entry.json"
+            dev_entry_path.write_text(
+                json.dumps(
+                    {
+                        "channel": "dev",
+                        "coreRepo": "lilixu3/danmu_api",
+                        "coreBranch": "main",
+                        "coreSha": sha,
+                        "dependencyFingerprint": fingerprint,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            with self.assertRaises(PackBuildError):
+                update_legacy_index(root / "index.json", dev_entry_path)
 
 
 if __name__ == "__main__":

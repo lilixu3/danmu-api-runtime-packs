@@ -1,0 +1,14 @@
+{
+  "schema": 2,
+  "channel": "dev",
+  "source": {
+    "repo": "lilixu3/danmu_api",
+    "branch": "main"
+  },
+  "excludedDirectDependencies": {
+    "chokidar": "server-only",
+    "dotenv": "server-only",
+    "esbuild": "build-only",
+    "redis": "optional"
+  }
+}

@@ -1,59 +1,104 @@
 # danmu-api Android Runtime Packs
 
-This repository publishes **derived Android runtime dependency packs** for the
-Danmu App. It does not mirror or replace the core source repository.
+This repository publishes **derived Android pure-JavaScript runtime dependency
+packs** for the Danmu App. It does not mirror or modify either core repository.
 
-## Source of truth
+## Trusted channels
 
-The only supported upstream core source is:
+Only these exact sources are accepted:
+
+| Channel | Repository | Branch | Signed index |
+|---|---|---|---|
+| `stable` | `huangxd-/danmu_api` | `main` | `stable/index.json` + `stable/index.sig` |
+| `dev` | `lilixu3/danmu_api` | `main` | `dev/index.json` + `dev/index.sig` |
+
+The builder accepts only `--channel stable` or `--channel dev`; repository and
+branch values come from its hard-coded allowlist. Arbitrary custom repositories
+are never cloned or packaged by the signing pipeline.
+
+The root `index.json` and `index.sig` remain a schema-1 **stable compatibility
+index** for older App versions. Development packs never enter that legacy index.
+
+## Channel isolation
+
+Stable and development packs are intentionally separate even when both core
+commits currently have the same dependency fingerprint. Each signed index,
+entry, manifest, Release tag, and asset carries the channel and exact source:
 
 ```text
-https://github.com/huangxd-/danmu_api.git
+stable-core-<sha12>/runtime-pack-stable-<sha12>.zip
+dev-core-<sha12>/runtime-pack-dev-<sha12>.zip
 ```
 
-The `coreRepo` value in every generated entry must remain exactly:
+The new App reads only the index matching its selected built-in core variant.
+There is no stable-to-dev, dev-to-stable, or custom-core fallback. If a matching
+signed pack is unavailable, the App aborts before live-core replacement and
+keeps the old core.
+
+## Security boundary
+
+Resolution and `worker.js` smoke run under Node.js 18.20.4 in a read-only build
+job without the signing private key or repository write credentials. A separate
+publish job receives only the verified output, publishes the immutable Release
+asset, updates the selected channel index, and signs it.
+
+The builder rejects:
+
+- `preinstall`, `install`, or `postinstall` lifecycle scripts;
+- `.node`, `.so`, `.dll`, `.dylib`, `binding.gyp`, and prebuilt binaries;
+- `os`, `cpu`, or `libc` constrained packages;
+- package-internal symbolic links;
+- Git/file/http/workspace/link/npm-alias or shorthand Git dependency specs.
+
+The App verifies the exact signed index bytes, channel, source repository and
+branch, archive URL/size/SHA-256, manifest, Node major, dependency fingerprint,
+runtime lock, package list, and every extracted file hash.
+
+## Policies
+
+Channel policy files live under:
 
 ```text
-huangxd-/danmu_api
+policies/stable.json
+policies/dev.json
 ```
 
-The App must never use this repository to treat `lilixu3/danmu_api` as the
-stable upstream core.
-
-## Pack contract
-
-Each pack is published from an exact official-upstream commit and contains only
-the Android pure-JavaScript dependency tree. The signed index also maps the
-canonical dependency fingerprint to that immutable pack. Stable, development,
-and custom App cores may reuse a pack only when their complete dependency
-fingerprint matches exactly; this never changes which repository is treated as
-the stable core source. If no signed fingerprint exists, the App keeps the old
-core and reports the unresolved dependencies.
-
-Resolution and `worker.js` smoke tests run under Node.js 18.20.4, matching the
-App's embedded Node major. The App verifies the signed index,
-archive SHA-256, embedded manifest, package list, and file hashes before
-activating a core update.
-
-The current policy intentionally excludes core dependencies that are server-
-only, build-only, or optional for Android (`chokidar`, `dotenv`, `esbuild`, and
-`redis`). A package with lifecycle install scripts, native artifacts, platform
-constraints, or prebuilt binaries is rejected rather than silently installed.
+Both currently exclude Android-non-runtime direct dependencies `chokidar`,
+`dotenv`, `esbuild`, and optional `redis`. Unsafe package signals are enforced in
+code and cannot be disabled by a policy file.
 
 ## Local build
+
+Stable:
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/build_runtime_pack.py \
-  --core-dir /path/to/danmu_api \
-  --core-repo huangxd-/danmu_api \
-  --core-sha <full-upstream-sha> \
+  --core-dir /path/to/huangxd-danmu_api \
+  --channel stable \
+  --core-sha <full-stable-sha> \
   --output-dir dist \
-  --policy policy.json \
+  --policy policies/stable.json \
   --node-major 18
 ```
 
-The scheduled workflow checks the official upstream `main` branch every two
-hours, builds a pack for a new commit, publishes an immutable GitHub Release
-asset, updates `signed index.json`, and signs the index with the repository
-secret. Manual dispatch remains available for immediate publication.
+Development:
+
+```bash
+python3 scripts/build_runtime_pack.py \
+  --core-dir /path/to/lilixu3-danmu_api \
+  --channel dev \
+  --core-sha <full-dev-sha> \
+  --output-dir dist \
+  --policy policies/dev.json \
+  --node-major 18
+```
+
+## Scheduling
+
+- Stable checks `huangxd-/danmu_api@main` at minute 17 every two hours.
+- Development checks `lilixu3/danmu_api@main` at minute 47 every two hours.
+- Manual `force` dispatch remains available per channel.
+
+Historical immutable packs from these two sources are retained for rollback;
+no third repository is admitted.

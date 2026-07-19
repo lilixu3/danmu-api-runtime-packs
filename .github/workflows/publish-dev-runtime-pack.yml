@@ -1,21 +1,21 @@
-name: Publish stable Android runtime pack
+name: Publish dev Android runtime pack
 
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild and replace the pack for the current stable SHA"
+        description: "Rebuild and replace the pack for the current dev SHA"
         required: false
         default: false
         type: boolean
   schedule:
-    - cron: "17 */2 * * *"
+    - cron: "47 */2 * * *"
 
 jobs:
   publish:
     uses: ./.github/workflows/_publish-channel-runtime-pack.yml
     with:
-      channel: stable
+      channel: dev
       force: ${{ inputs.force || false }}
     secrets:
       RUNTIME_PACK_SIGNING_PRIVATE_KEY: ${{ secrets.RUNTIME_PACK_SIGNING_PRIVATE_KEY }}

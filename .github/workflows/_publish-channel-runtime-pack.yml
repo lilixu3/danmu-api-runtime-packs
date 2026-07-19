@@ -1,0 +1,274 @@
+name: Publish one runtime-pack channel
+
+on:
+  workflow_call:
+    inputs:
+      channel:
+        description: "Trusted dependency channel: stable or dev"
+        required: true
+        type: string
+      force:
+        description: "Rebuild and replace the pack for the current channel SHA"
+        required: false
+        default: false
+        type: boolean
+    secrets:
+      RUNTIME_PACK_SIGNING_PRIVATE_KEY:
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: runtime-pack-index-writer
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      exists: ${{ steps.source.outputs.exists }}
+      sha: ${{ steps.source.outputs.sha }}
+      short: ${{ steps.source.outputs.short }}
+      repo: ${{ steps.source.outputs.repo }}
+      branch: ${{ steps.source.outputs.branch }}
+    steps:
+      - name: Checkout pack repository without write credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 18.20.4
+          check-latest: false
+
+      - name: Run pack-generator tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Resolve trusted channel source
+        id: source
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          FORCE_PUBLISH: ${{ inputs.force }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            stable)
+              repo="huangxd-/danmu_api"
+              branch="main"
+              url="https://github.com/huangxd-/danmu_api.git"
+              ;;
+            dev)
+              repo="lilixu3/danmu_api"
+              branch="main"
+              url="https://github.com/lilixu3/danmu_api.git"
+              ;;
+            *)
+              echo "不受支持的依赖通道：$CHANNEL" >&2
+              exit 2
+              ;;
+          esac
+          sha="$(git ls-remote "$url" "refs/heads/$branch" | python3 -c 'import sys; data=sys.stdin.read().split(); print(data[0] if data else "")')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "$repo@$branch 未返回完整 commit SHA" >&2
+            exit 1
+          fi
+          index="$CHANNEL/index.json"
+          if [[ -f "$index" ]] && jq -e --arg sha "$sha" \
+            '.entries[$sha] as $entry | ($entry != null) and (.dependencyEntries[$entry.dependencyFingerprint] == $sha)' \
+            "$index" >/dev/null \
+            && [[ "$FORCE_PUBLISH" != "true" ]]; then
+            exists=true
+          else
+            exists=false
+          fi
+          {
+            echo "exists=$exists"
+            echo "sha=$sha"
+            echo "short=${sha:0:12}"
+            echo "repo=$repo"
+            echo "branch=$branch"
+          } >> "$GITHUB_OUTPUT"
+          echo "检测到 $CHANNEL：$repo@$branch @ $sha，已发布=$exists"
+
+      - name: Checkout exact trusted core commit
+        if: steps.source.outputs.exists != 'true'
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          CORE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          case "$CHANNEL" in
+            stable) url="https://github.com/huangxd-/danmu_api.git" ;;
+            dev) url="https://github.com/lilixu3/danmu_api.git" ;;
+            *) exit 2 ;;
+          esac
+          git clone --filter=blob:none --no-checkout "$url" "$RUNNER_TEMP/danmu-api-core"
+          git -C "$RUNNER_TEMP/danmu-api-core" checkout --detach "$CORE_SHA"
+          test "$(git -C "$RUNNER_TEMP/danmu-api-core" rev-parse HEAD)" = "$CORE_SHA"
+
+      - name: Build and smoke-test pure-JS dependency pack
+        if: steps.source.outputs.exists != 'true'
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          CORE_SHA: ${{ steps.source.outputs.sha }}
+          SHORT_SHA: ${{ steps.source.outputs.short }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python3 scripts/build_runtime_pack.py \
+            --core-dir "$RUNNER_TEMP/danmu-api-core" \
+            --channel "$CHANNEL" \
+            --core-sha "$CORE_SHA" \
+            --output-dir dist \
+            --policy "policies/$CHANNEL.json" \
+            --node-major 18 \
+            --artifact-url-base "https://github.com/${GITHUB_REPOSITORY}/releases/download/${CHANNEL}-core-${SHORT_SHA}"
+          jq -e \
+            --arg channel "$CHANNEL" \
+            --arg repo "${{ steps.source.outputs.repo }}" \
+            --arg branch "${{ steps.source.outputs.branch }}" \
+            --arg sha "$CORE_SHA" \
+            '(.channel == $channel) and (.coreRepo == $repo) and (.coreBranch == $branch) and (.coreSha == $sha) and (.artifactSha256 | test("^[0-9a-f]{64}$"))' \
+            dist/entry.json >/dev/null
+
+      - name: Upload verified build output
+        if: steps.source.outputs.exists != 'true'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: runtime-pack-${{ inputs.channel }}-${{ steps.source.outputs.short }}
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: build
+    if: needs.build.outputs.exists != 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout latest pack repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+
+      - name: Download verified build output
+        uses: actions/download-artifact@634f93cb2916e3fdff6788551b99b062d0335ce0 # v5
+        with:
+          name: runtime-pack-${{ inputs.channel }}-${{ needs.build.outputs.short }}
+          path: dist
+
+      - name: Publish immutable channel release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CHANNEL: ${{ inputs.channel }}
+          CORE_SHA: ${{ needs.build.outputs.sha }}
+          SHORT_SHA: ${{ needs.build.outputs.short }}
+          CORE_REPO: ${{ needs.build.outputs.repo }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${CHANNEL}-core-${SHORT_SHA}"
+          asset="dist/runtime-pack-${CHANNEL}-${SHORT_SHA}.zip"
+          test -f "$asset"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "${CHANNEL} runtime pack ${SHORT_SHA}" \
+              --notes "Derived only from ${CORE_REPO}@main @ ${CORE_SHA}."
+          fi
+
+      - name: Publish legacy stable asset alias
+        if: inputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHORT_SHA: ${{ needs.build.outputs.short }}
+          CORE_SHA: ${{ needs.build.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          source_asset="dist/runtime-pack-stable-${SHORT_SHA}.zip"
+          legacy_asset="dist/runtime-pack-${SHORT_SHA}.zip"
+          cp "$source_asset" "$legacy_asset"
+          tag="core-${SHORT_SHA}"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$legacy_asset" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$legacy_asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Legacy stable runtime pack ${SHORT_SHA}" \
+              --notes "Compatibility alias for stable core ${CORE_SHA}."
+          fi
+
+      - name: Update and sign channel index
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          FORCE_PUBLISH: ${{ inputs.force }}
+          RUNTIME_PACK_SIGNING_PRIVATE_KEY: ${{ secrets.RUNTIME_PACK_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNTIME_PACK_SIGNING_PRIVATE_KEY"
+          mkdir -p "$CHANNEL"
+          update_args=(--index "$CHANNEL/index.json" --entry dist/entry.json --channel "$CHANNEL")
+          if [[ "$FORCE_PUBLISH" == "true" ]]; then
+            update_args+=(--replace)
+          fi
+          python3 -m scripts.update_index "${update_args[@]}" > /dev/null
+          if [[ "$CHANNEL" == "stable" ]]; then
+            python3 -m scripts.update_legacy_index \
+              --index index.json \
+              --entry dist/entry.json \
+              --replace > /dev/null
+          fi
+
+          key="$RUNNER_TEMP/runtime-pack-signing-key.pem"
+          sig="$RUNNER_TEMP/index.sig.bin"
+          umask 077
+          printf '%s\n' "$RUNTIME_PACK_SIGNING_PRIVATE_KEY" > "$key"
+          sign_index() {
+            local index_path="$1"
+            local signature_path="$2"
+            openssl dgst -sha256 -sign "$key" -out "$sig" "$index_path"
+            base64 -w0 "$sig" > "$signature_path"
+            openssl dgst -sha256 -verify runtime-pack-public-key.pem -signature "$sig" "$index_path"
+          }
+          sign_index "$CHANNEL/index.json" "$CHANNEL/index.sig"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            sign_index index.json index.sig
+          fi
+          rm -f "$key" "$sig"
+
+      - name: Commit signed indexes
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          SHORT_SHA: ${{ needs.build.outputs.short }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add "$CHANNEL/index.json" "$CHANNEL/index.sig"
+          if [[ "$CHANNEL" == "stable" ]]; then
+            git add index.json index.sig
+          fi
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "签名索引无变化，无需提交。"
+            exit 0
+          fi
+          git commit -m "发布 ${CHANNEL} 核心 ${SHORT_SHA} 运行时依赖包"
+          git push origin HEAD:main

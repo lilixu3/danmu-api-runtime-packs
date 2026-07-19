@@ -1,8 +1,12 @@
 """Build signed-input Android runtime dependency packs for the Danmu App.
 
-The source of truth for core commits is intentionally the official upstream
-repository ``huangxd-/danmu_api``.  The pack repository is only a derived,
-Android-specific artifact repository; it never becomes a core source mirror.
+Only two core sources are trusted:
+
+* ``stable`` -> ``huangxd-/danmu_api@main``
+* ``dev`` -> ``lilixu3/danmu_api@main``
+
+The pack repository is only a derived Android-specific artifact repository; it
+never becomes a core source mirror and never builds arbitrary custom cores.
 """
 
 from __future__ import annotations
@@ -19,9 +23,22 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-UPSTREAM_CORE_REPO = "huangxd-/danmu_api"
+UPSTREAM_CORE_REPO = "huangxd-/danmu_api"  # Legacy stable-index compatibility.
 RUNTIME_PROTOCOL = 1
+INDEX_SCHEMA = 2
 EMBEDDED_NODE_MAJOR = 18
+TRUSTED_CHANNELS: dict[str, dict[str, str]] = {
+    "stable": {
+        "repo": "huangxd-/danmu_api",
+        "branch": "main",
+        "url": "https://github.com/huangxd-/danmu_api.git",
+    },
+    "dev": {
+        "repo": "lilixu3/danmu_api",
+        "branch": "main",
+        "url": "https://github.com/lilixu3/danmu_api.git",
+    },
+}
 _DISALLOWED_INSTALL_SCRIPTS = {"preinstall", "install", "postinstall"}
 _NATIVE_SUFFIXES = {".node", ".so", ".dylib", ".dll"}
 _NATIVE_FILENAMES = {"binding.gyp", "binding.cc", "binding.c", "binding.cpp"}
@@ -29,6 +46,24 @@ _NATIVE_FILENAMES = {"binding.gyp", "binding.cc", "binding.c", "binding.cpp"}
 
 class PackBuildError(RuntimeError):
     """Raised when a dependency tree is not safe for the pure-JS runtime lane."""
+
+
+def trusted_channel(channel: str) -> dict[str, str]:
+    normalized = channel.strip().lower()
+    source = TRUSTED_CHANNELS.get(normalized)
+    if source is None:
+        raise PackBuildError(f"不受支持的依赖通道：{channel}")
+    return {"channel": normalized, **source}
+
+
+def validate_channel_source(channel: str, core_repo: str, core_branch: str) -> dict[str, str]:
+    source = trusted_channel(channel)
+    if core_repo != source["repo"] or core_branch != source["branch"]:
+        raise PackBuildError(
+            f"依赖通道来源不匹配：{source['channel']} 只允许 "
+            f"{source['repo']}@{source['branch']}"
+        )
+    return source
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -260,7 +295,9 @@ def build_file_manifest(node_modules_dir: Path) -> list[dict[str, Any]]:
 
 def build_manifest(
     *,
+    channel: str,
     core_repo: str,
+    core_branch: str,
     core_sha: str,
     core_version: str,
     dependency_fingerprint: str,
@@ -269,13 +306,14 @@ def build_manifest(
     runtime_protocol: int = RUNTIME_PROTOCOL,
     node_major: int = EMBEDDED_NODE_MAJOR,
 ) -> dict[str, Any]:
-    if core_repo != UPSTREAM_CORE_REPO:
-        raise PackBuildError(f"核心来源不受信任：{core_repo}")
+    source = validate_channel_source(channel, core_repo, core_branch)
     if not re.fullmatch(r"[0-9a-fA-F]{40}", core_sha):
         raise PackBuildError(f"核心 SHA 不是完整 40 位 commit：{core_sha}")
     return {
-        "schema": 1,
+        "schema": INDEX_SCHEMA,
+        "channel": source["channel"],
         "coreRepo": core_repo,
+        "coreBranch": core_branch,
         "coreSha": core_sha.lower(),
         "coreVersion": core_version,
         "runtimeProtocol": runtime_protocol,
@@ -286,25 +324,48 @@ def build_manifest(
     }
 
 
+def new_channel_index(channel: str) -> dict[str, Any]:
+    source = trusted_channel(channel)
+    return {
+        "schema": INDEX_SCHEMA,
+        "channel": source["channel"],
+        "source": {"repo": source["repo"], "branch": source["branch"]},
+        "entries": {},
+        "dependencyEntries": {},
+    }
+
+
 def merge_index_entry(
     index: dict[str, Any],
     entry: dict[str, Any],
     *,
+    channel: str,
     replace: bool = False,
 ) -> dict[str, Any]:
-    if entry.get("coreRepo") != UPSTREAM_CORE_REPO:
-        raise PackBuildError(f"拒绝写入非上游核心索引：{entry.get('coreRepo')}")
+    source = trusted_channel(channel)
+    validate_channel_source(
+        source["channel"],
+        str(entry.get("coreRepo") or ""),
+        str(entry.get("coreBranch") or ""),
+    )
+    if str(entry.get("channel") or "") != source["channel"]:
+        raise PackBuildError("依赖包 entry 通道与目标索引不一致")
     core_sha = str(entry.get("coreSha") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{40}", core_sha):
         raise PackBuildError(f"索引 entry 缺少完整核心 SHA：{core_sha}")
     fingerprint = str(entry.get("dependencyFingerprint") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
         raise PackBuildError(f"索引 entry 缺少有效依赖指纹：{fingerprint}")
-    result = dict(index) if isinstance(index, dict) else {}
-    result.setdefault("schema", 1)
-    result.setdefault("upstream", {"repo": UPSTREAM_CORE_REPO, "branch": "main"})
-    if result["upstream"].get("repo") != UPSTREAM_CORE_REPO:
-        raise PackBuildError("现有索引 upstream 不是官方核心仓库")
+
+    result = dict(index) if isinstance(index, dict) and index else new_channel_index(channel)
+    if result.get("schema") != INDEX_SCHEMA:
+        raise PackBuildError("现有索引协议版本不受支持")
+    if result.get("channel") != source["channel"]:
+        raise PackBuildError("现有索引通道不匹配")
+    expected_source = {"repo": source["repo"], "branch": source["branch"]}
+    if result.get("source") != expected_source:
+        raise PackBuildError("现有索引来源与受信任通道不匹配")
+
     entries = dict(result.get("entries") or {})
     previous = entries.get(core_sha)
     if previous is not None and previous != entry and not replace:
@@ -387,7 +448,9 @@ def extract_core_version(core_dir: Path) -> str:
 def build_pack(
     *,
     core_dir: Path,
+    channel: str,
     core_repo: str,
+    core_branch: str,
     core_sha: str,
     output_dir: Path,
     policy: dict[str, Any],
@@ -395,8 +458,13 @@ def build_pack(
     skip_smoke: bool = False,
     node_major: int = EMBEDDED_NODE_MAJOR,
 ) -> dict[str, Any]:
-    if core_repo != UPSTREAM_CORE_REPO:
-        raise PackBuildError(f"只允许构建官方上游核心：{UPSTREAM_CORE_REPO}")
+    source = validate_channel_source(channel, core_repo, core_branch)
+    policy_channel = str(policy.get("channel") or "")
+    policy_source = policy.get("source") or {}
+    if policy_channel and policy_channel != source["channel"]:
+        raise PackBuildError("依赖策略通道与构建通道不一致")
+    if policy_source and policy_source != {"repo": core_repo, "branch": core_branch}:
+        raise PackBuildError("依赖策略来源与构建来源不一致")
     package_json = read_json(core_dir / "package.json")
     if not isinstance(package_json, dict):
         raise PackBuildError("核心根 package.json 不是对象")
@@ -407,7 +475,7 @@ def build_pack(
 
     output_dir.mkdir(parents=True, exist_ok=True)
     short_sha = core_sha[:12].lower()
-    archive_name = f"runtime-pack-{short_sha}.zip"
+    archive_name = f"runtime-pack-{source['channel']}-{short_sha}.zip"
     with tempfile.TemporaryDirectory(prefix="danmu-pack-build-") as tmp:
         work = Path(tmp)
         project = work / "npm-project"
@@ -455,7 +523,9 @@ def build_pack(
         # Keep the exact resolver output for diagnosis and future verification.
         shutil.copy2(project / "package-lock.json", pack_root / "runtime-lock.json")
         manifest = build_manifest(
+            channel=source["channel"],
             core_repo=core_repo,
+            core_branch=core_branch,
             core_sha=core_sha,
             core_version=extract_core_version(core_dir),
             dependency_fingerprint=dependency_fingerprint(all_dependencies),
@@ -474,7 +544,9 @@ def build_pack(
     base = artifact_url_base.rstrip("/")
     artifact_url = f"{base}/{archive_name}" if base else archive_name
     entry = {
+        "channel": source["channel"],
         "coreRepo": core_repo,
+        "coreBranch": core_branch,
         "coreSha": core_sha.lower(),
         "coreVersion": manifest["coreVersion"],
         "runtimeProtocol": RUNTIME_PROTOCOL,
@@ -492,7 +564,7 @@ def build_pack(
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--core-dir", type=Path, required=True)
-    parser.add_argument("--core-repo", default=UPSTREAM_CORE_REPO)
+    parser.add_argument("--channel", choices=sorted(TRUSTED_CHANNELS), required=True)
     parser.add_argument("--core-sha", required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
@@ -501,10 +573,13 @@ def main() -> int:
     parser.add_argument("--skip-smoke", action="store_true")
     args = parser.parse_args()
     policy = read_json(args.policy)
+    source = trusted_channel(args.channel)
     try:
         entry = build_pack(
             core_dir=args.core_dir,
-            core_repo=args.core_repo,
+            channel=source["channel"],
+            core_repo=source["repo"],
+            core_branch=source["branch"],
             core_sha=args.core_sha,
             output_dir=args.output_dir,
             policy=policy,

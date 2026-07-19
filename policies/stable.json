@@ -1,0 +1,14 @@
+{
+  "schema": 2,
+  "channel": "stable",
+  "source": {
+    "repo": "huangxd-/danmu_api",
+    "branch": "main"
+  },
+  "excludedDirectDependencies": {
+    "chokidar": "server-only",
+    "dotenv": "server-only",
+    "esbuild": "build-only",
+    "redis": "optional"
+  }
+}
