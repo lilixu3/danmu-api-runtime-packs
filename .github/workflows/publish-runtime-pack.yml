@@ -1,0 +1,132 @@
+name: Publish upstream Android runtime pack
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/15 * * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: upstream-runtime-pack-publisher
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    env:
+      UPSTREAM_CORE_REPO: huangxd-/danmu_api
+      UPSTREAM_CORE_URL: https://github.com/huangxd-/danmu_api.git
+    steps:
+      - name: Checkout pack repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Node.js
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          check-latest: false
+
+      - name: Run pack-generator tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Resolve official upstream main
+        id: upstream
+        shell: bash
+        run: |
+          set -euo pipefail
+          sha="$(git ls-remote "$UPSTREAM_CORE_URL" 'refs/heads/main' | awk 'NR==1 {print $1}')"
+          if [[ ! "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "官方上游 main 未返回完整 commit SHA" >&2
+            exit 1
+          fi
+          if [[ -f index.json ]] && jq -e --arg sha "$sha" '.entries[$sha] != null' index.json >/dev/null; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "sha=$sha" >> "$GITHUB_OUTPUT"
+          echo "short=${sha:0:12}" >> "$GITHUB_OUTPUT"
+          echo "检测到官方上游 $UPSTREAM_CORE_REPO @ $sha"
+
+      - name: Stop when the current upstream commit is already published
+        if: steps.upstream.outputs.exists == 'true'
+        run: echo "该官方上游 commit 已有依赖包，保持幂等。"
+
+      - name: Checkout the exact official upstream commit
+        if: steps.upstream.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none --no-checkout "$UPSTREAM_CORE_URL" "$RUNNER_TEMP/danmu-api-core"
+          git -C "$RUNNER_TEMP/danmu-api-core" checkout --detach "${{ steps.upstream.outputs.sha }}"
+          test "$(git -C "$RUNNER_TEMP/danmu-api-core" rev-parse HEAD)" = "${{ steps.upstream.outputs.sha }}"
+
+      - name: Build and smoke-test the pure-JS dependency pack
+        if: steps.upstream.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python3 scripts/build_runtime_pack.py \
+            --core-dir "$RUNNER_TEMP/danmu-api-core" \
+            --core-repo "$UPSTREAM_CORE_REPO" \
+            --core-sha "${{ steps.upstream.outputs.sha }}" \
+            --output-dir dist \
+            --policy policy.json \
+            --artifact-url-base "https://github.com/${GITHUB_REPOSITORY}/releases/download/core-${{ steps.upstream.outputs.short }}"
+          jq -e --arg sha "${{ steps.upstream.outputs.sha }}" \
+            '(.coreRepo == "huangxd-/danmu_api") and (.coreSha == $sha) and (.artifactSha256 | test("^[0-9a-f]{64}$"))' \
+            dist/entry.json >/dev/null
+
+      - name: Publish immutable release asset
+        if: steps.upstream.outputs.exists != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="core-${{ steps.upstream.outputs.short }}"
+          asset="dist/runtime-pack-${{ steps.upstream.outputs.short }}.zip"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$tag" "$asset" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Runtime pack for upstream ${{ steps.upstream.outputs.short }}" \
+              --notes "Derived only from huangxd-/danmu_api @ ${{ steps.upstream.outputs.sha }}."
+          fi
+
+      - name: Update and sign the index
+        if: steps.upstream.outputs.exists != 'true'
+        env:
+          RUNTIME_PACK_SIGNING_PRIVATE_KEY: ${{ secrets.RUNTIME_PACK_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNTIME_PACK_SIGNING_PRIVATE_KEY"
+          python3 -m scripts.update_index --index index.json --entry dist/entry.json > /dev/null
+          key="$RUNNER_TEMP/runtime-pack-signing-key.pem"
+          sig="$RUNNER_TEMP/index.sig.bin"
+          umask 077
+          printf '%s\n' "$RUNTIME_PACK_SIGNING_PRIVATE_KEY" > "$key"
+          openssl dgst -sha256 -sign "$key" -out "$sig" index.json
+          base64 -w0 "$sig" > index.sig
+          openssl dgst -sha256 -verify runtime-pack-public-key.pem -signature "$sig" index.json
+          rm -f "$key" "$sig"
+
+      - name: Commit the signed index
+        if: steps.upstream.outputs.exists != 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add index.json index.sig
+          git diff --cached --check
+          git commit -m "发布上游核心 ${{ steps.upstream.outputs.short }} 运行时依赖包"
+          git push origin HEAD:main

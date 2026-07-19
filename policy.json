@@ -1,0 +1,16 @@
+{
+  "schema": 1,
+  "upstreamCoreRepo": "huangxd-/danmu_api",
+  "upstreamCoreBranch": "main",
+  "excludedDirectDependencies": {
+    "chokidar": "server-only",
+    "dotenv": "server-only",
+    "esbuild": "build-only",
+    "redis": "optional"
+  },
+  "rejectedPackageSignals": {
+    "scripts": ["preinstall", "install", "postinstall"],
+    "nativeSuffixes": [".node", ".so", ".dylib", ".dll"],
+    "nativeFiles": ["binding.gyp", "binding.cc", "binding.c", "binding.cpp"]
+  }
+}
