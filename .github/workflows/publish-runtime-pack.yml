@@ -9,7 +9,7 @@ on:
         default: false
         type: boolean
   schedule:
-    - cron: "*/15 * * * *"
+    - cron: "17 */2 * * *"
 
 permissions:
   contents: write
@@ -51,7 +51,9 @@ jobs:
             echo "官方上游 main 未返回完整 commit SHA" >&2
             exit 1
           fi
-          if [[ -f index.json ]] && jq -e --arg sha "$sha" '.entries[$sha] != null' index.json >/dev/null \
+          if [[ -f index.json ]] && jq -e --arg sha "$sha" \
+            '.entries[$sha] as $entry | ($entry != null) and (.dependencyEntries[$entry.dependencyFingerprint] == $sha)' \
+            index.json >/dev/null \
             && [[ "$FORCE_PUBLISH" != "true" ]]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else

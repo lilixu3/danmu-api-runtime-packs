@@ -277,6 +277,9 @@ def merge_index_entry(
     core_sha = str(entry.get("coreSha") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{40}", core_sha):
         raise PackBuildError(f"索引 entry 缺少完整核心 SHA：{core_sha}")
+    fingerprint = str(entry.get("dependencyFingerprint") or "").lower()
+    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
+        raise PackBuildError(f"索引 entry 缺少有效依赖指纹：{fingerprint}")
     result = dict(index) if isinstance(index, dict) else {}
     result.setdefault("schema", 1)
     result.setdefault("upstream", {"repo": UPSTREAM_CORE_REPO, "branch": "main"})
@@ -288,6 +291,9 @@ def merge_index_entry(
         raise PackBuildError(f"同一核心 SHA 已存在不同依赖包：{core_sha}")
     entries[core_sha] = entry
     result["entries"] = dict(sorted(entries.items()))
+    dependency_entries = dict(result.get("dependencyEntries") or {})
+    dependency_entries[fingerprint] = core_sha
+    result["dependencyEntries"] = dict(sorted(dependency_entries.items()))
     return result
 
 

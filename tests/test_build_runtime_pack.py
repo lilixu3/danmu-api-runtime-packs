@@ -124,8 +124,19 @@ class BuildRuntimePackTest(unittest.TestCase):
 
     def test_merge_index_replaces_existing_entry_only_when_explicitly_forced(self):
         sha = "a" * 40
-        old = {"coreRepo": UPSTREAM_CORE_REPO, "coreSha": sha, "artifactSha256": "1" * 64}
-        new = {"coreRepo": UPSTREAM_CORE_REPO, "coreSha": sha, "artifactSha256": "2" * 64}
+        fingerprint = "b" * 64
+        old = {
+            "coreRepo": UPSTREAM_CORE_REPO,
+            "coreSha": sha,
+            "dependencyFingerprint": fingerprint,
+            "artifactSha256": "1" * 64,
+        }
+        new = {
+            "coreRepo": UPSTREAM_CORE_REPO,
+            "coreSha": sha,
+            "dependencyFingerprint": fingerprint,
+            "artifactSha256": "2" * 64,
+        }
         index = {
             "schema": 1,
             "upstream": {"repo": UPSTREAM_CORE_REPO, "branch": "main"},
@@ -135,6 +146,14 @@ class BuildRuntimePackTest(unittest.TestCase):
             merge_index_entry(index, new)
         result = merge_index_entry(index, new, replace=True)
         self.assertEqual(new, result["entries"][sha])
+        self.assertEqual(sha, result["dependencyEntries"][fingerprint])
+
+    def test_merge_index_rejects_entry_without_dependency_fingerprint(self):
+        with self.assertRaises(PackBuildError):
+            merge_index_entry(
+                {"schema": 1, "entries": {}},
+                {"coreRepo": UPSTREAM_CORE_REPO, "coreSha": "a" * 40},
+            )
 
     def test_ignores_package_internal_subpath_package_json(self):
         lock = {

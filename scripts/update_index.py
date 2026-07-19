@@ -23,6 +23,7 @@ def update_index(index_path: Path, entry_path: Path, *, replace: bool = False) -
             "schema": 1,
             "upstream": {"repo": UPSTREAM_CORE_REPO, "branch": "main"},
             "entries": {},
+            "dependencyEntries": {},
         }
     entry = read_json(entry_path)
     result = merge_index_entry(current, entry, replace=replace)
