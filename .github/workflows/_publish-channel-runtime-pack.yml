@@ -194,7 +194,17 @@ jobs:
           asset="dist/runtime-pack-${CHANNEL}-${SHORT_SHA}.zip"
           test -f "$asset"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "$asset" --repo "$GITHUB_REPOSITORY" --clobber
+            existing_dir="$(mktemp -d)"
+            trap 'rm -rf "$existing_dir"' EXIT
+            gh release download "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$(basename "$asset")" \
+              --dir "$existing_dir"
+            if ! cmp --silent "$asset" "$existing_dir/$(basename "$asset")"; then
+              echo "::error::已发布的通道依赖包不可覆盖：$tag" >&2
+              sha256sum "$asset" "$existing_dir/$(basename "$asset")" >&2
+              exit 1
+            fi
           else
             gh release create "$tag" "$asset" \
               --repo "$GITHUB_REPOSITORY" \
@@ -215,7 +225,17 @@ jobs:
           test -f "$legacy_asset"
           tag="core-${SHORT_SHA}"
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
-            gh release upload "$tag" "$legacy_asset" --repo "$GITHUB_REPOSITORY" --clobber
+            existing_dir="$(mktemp -d)"
+            trap 'rm -rf "$existing_dir"' EXIT
+            gh release download "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern "$(basename "$legacy_asset")" \
+              --dir "$existing_dir"
+            if ! cmp --silent "$legacy_asset" "$existing_dir/$(basename "$legacy_asset")"; then
+              echo "::error::已发布的旧版兼容依赖包不可覆盖：$tag" >&2
+              sha256sum "$legacy_asset" "$existing_dir/$(basename "$legacy_asset")" >&2
+              exit 1
+            fi
           else
             gh release create "$tag" "$legacy_asset" \
               --repo "$GITHUB_REPOSITORY" \

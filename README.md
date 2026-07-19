@@ -42,7 +42,9 @@ keeps the old core.
 Resolution and `worker.js` smoke run under Node.js 18.20.4 in a read-only build
 job without the signing private key or repository write credentials. A separate
 publish job receives only the verified output, publishes the immutable Release
-asset, updates the selected channel index, and signs it.
+asset, updates the selected channel index, and signs it. If a same-SHA Release
+already exists, the job downloads it and requires byte-for-byte equality; a
+mismatch fails before the index is changed, and `--clobber` is forbidden.
 
 The builder rejects:
 
@@ -100,7 +102,8 @@ python3 scripts/build_runtime_pack.py \
 
 - Stable checks `huangxd-/danmu_api@main` at minute 17 every two hours.
 - Development checks `lilixu3/danmu_api@main` at minute 47 every two hours.
-- Manual `force` dispatch remains available per channel.
+- Manual `force` dispatch remains available per channel for diagnostics or recovery
+  when that SHA's Release does not yet exist; it never overwrites an existing asset.
 
 Historical immutable packs from these two sources are retained for rollback;
 no third repository is admitted.

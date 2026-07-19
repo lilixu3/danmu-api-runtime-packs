@@ -30,6 +30,16 @@ from scripts.update_legacy_index import update_legacy_index
 
 
 class BuildRuntimePackTest(unittest.TestCase):
+    def test_release_assets_are_immutable(self):
+        workflow = (
+            Path(__file__).resolve().parents[1]
+            / ".github/workflows/_publish-channel-runtime-pack.yml"
+        ).read_text(encoding="utf-8")
+        self.assertNotIn("--clobber", workflow)
+        self.assertEqual(2, workflow.count("cmp --silent"))
+        self.assertIn("已发布的通道依赖包不可覆盖", workflow)
+        self.assertIn("已发布的旧版兼容依赖包不可覆盖", workflow)
+
     def test_uses_only_the_stable_and_dev_core_repositories(self):
         self.assertEqual(UPSTREAM_CORE_REPO, "huangxd-/danmu_api")
         self.assertEqual(
