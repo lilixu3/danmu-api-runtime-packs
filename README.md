@@ -23,7 +23,8 @@ stable upstream core.
 ## Pack contract
 
 Each pack is keyed by the full upstream commit SHA and contains only the
-Android pure-JavaScript dependency tree. The App verifies the signed index,
+Android pure-JavaScript dependency tree. Resolution and `worker.js` smoke tests
+run under Node.js 18.20.4, matching the App's embedded Node major. The App verifies the signed index,
 archive SHA-256, embedded manifest, package list, and file hashes before
 activating a core update.
 
@@ -41,7 +42,8 @@ python3 scripts/build_runtime_pack.py \
   --core-repo huangxd-/danmu_api \
   --core-sha <full-upstream-sha> \
   --output-dir dist \
-  --policy policy.json
+  --policy policy.json \
+  --node-major 18
 ```
 
 The scheduled workflow checks the official upstream `main` branch, builds a

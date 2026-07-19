@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 from scripts.build_runtime_pack import (
+    EMBEDDED_NODE_MAJOR,
     PackBuildError,
     UPSTREAM_CORE_REPO,
     build_manifest,
@@ -121,6 +122,20 @@ class BuildRuntimePackTest(unittest.TestCase):
                 {"coreRepo": "lilixu3/danmu_api", "coreSha": "abc"},
             )
 
+    def test_merge_index_replaces_existing_entry_only_when_explicitly_forced(self):
+        sha = "a" * 40
+        old = {"coreRepo": UPSTREAM_CORE_REPO, "coreSha": sha, "artifactSha256": "1" * 64}
+        new = {"coreRepo": UPSTREAM_CORE_REPO, "coreSha": sha, "artifactSha256": "2" * 64}
+        index = {
+            "schema": 1,
+            "upstream": {"repo": UPSTREAM_CORE_REPO, "branch": "main"},
+            "entries": {sha: old},
+        }
+        with self.assertRaises(PackBuildError):
+            merge_index_entry(index, new)
+        result = merge_index_entry(index, new, replace=True)
+        self.assertEqual(new, result["entries"][sha])
+
     def test_ignores_package_internal_subpath_package_json(self):
         lock = {
             "packages": {
@@ -170,6 +185,8 @@ class BuildRuntimePackTest(unittest.TestCase):
                 ],
             )
         self.assertEqual(UPSTREAM_CORE_REPO, manifest["coreRepo"])
+        self.assertEqual(18, EMBEDDED_NODE_MAJOR)
+        self.assertEqual(EMBEDDED_NODE_MAJOR, manifest["nodeMajor"])
         paths = {item["path"]: item for item in manifest["files"]}
         self.assertIn("node_modules/pure-package/index.js", paths)
         self.assertEqual(

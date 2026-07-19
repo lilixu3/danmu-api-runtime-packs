@@ -21,6 +21,7 @@ from typing import Any, Iterable
 
 UPSTREAM_CORE_REPO = "huangxd-/danmu_api"
 RUNTIME_PROTOCOL = 1
+EMBEDDED_NODE_MAJOR = 18
 _DISALLOWED_INSTALL_SCRIPTS = {"preinstall", "install", "postinstall"}
 _NATIVE_SUFFIXES = {".node", ".so", ".dylib", ".dll"}
 _NATIVE_FILENAMES = {"binding.gyp", "binding.cc", "binding.c", "binding.cpp"}
@@ -246,6 +247,7 @@ def build_manifest(
     node_modules_dir: Path,
     package_records: list[dict[str, Any]],
     runtime_protocol: int = RUNTIME_PROTOCOL,
+    node_major: int = EMBEDDED_NODE_MAJOR,
 ) -> dict[str, Any]:
     if core_repo != UPSTREAM_CORE_REPO:
         raise PackBuildError(f"核心来源不受信任：{core_repo}")
@@ -257,13 +259,19 @@ def build_manifest(
         "coreSha": core_sha.lower(),
         "coreVersion": core_version,
         "runtimeProtocol": runtime_protocol,
+        "nodeMajor": node_major,
         "dependencyFingerprint": dependency_fingerprint,
         "packages": package_records,
         "files": build_file_manifest(node_modules_dir),
     }
 
 
-def merge_index_entry(index: dict[str, Any], entry: dict[str, Any]) -> dict[str, Any]:
+def merge_index_entry(
+    index: dict[str, Any],
+    entry: dict[str, Any],
+    *,
+    replace: bool = False,
+) -> dict[str, Any]:
     if entry.get("coreRepo") != UPSTREAM_CORE_REPO:
         raise PackBuildError(f"拒绝写入非上游核心索引：{entry.get('coreRepo')}")
     core_sha = str(entry.get("coreSha") or "").lower()
@@ -276,7 +284,7 @@ def merge_index_entry(index: dict[str, Any], entry: dict[str, Any]) -> dict[str,
         raise PackBuildError("现有索引 upstream 不是官方核心仓库")
     entries = dict(result.get("entries") or {})
     previous = entries.get(core_sha)
-    if previous is not None and previous != entry:
+    if previous is not None and previous != entry and not replace:
         raise PackBuildError(f"同一核心 SHA 已存在不同依赖包：{core_sha}")
     entries[core_sha] = entry
     result["entries"] = dict(sorted(entries.items()))
@@ -359,6 +367,7 @@ def build_pack(
     policy: dict[str, Any],
     artifact_url_base: str = "",
     skip_smoke: bool = False,
+    node_major: int = EMBEDDED_NODE_MAJOR,
 ) -> dict[str, Any]:
     if core_repo != UPSTREAM_CORE_REPO:
         raise PackBuildError(f"只允许构建官方上游核心：{UPSTREAM_CORE_REPO}")
@@ -426,6 +435,7 @@ def build_pack(
             dependency_fingerprint=dependency_fingerprint(all_dependencies),
             node_modules_dir=pack_node_modules,
             package_records=records,
+            node_major=node_major,
         )
         write_canonical_json(pack_root / "manifest.json", manifest)
         archive_path = output_dir / archive_name
@@ -461,6 +471,7 @@ def main() -> int:
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument("--policy", type=Path, required=True)
     parser.add_argument("--artifact-url-base", default="")
+    parser.add_argument("--node-major", type=int, default=EMBEDDED_NODE_MAJOR)
     parser.add_argument("--skip-smoke", action="store_true")
     args = parser.parse_args()
     policy = read_json(args.policy)
@@ -473,6 +484,7 @@ def main() -> int:
             policy=policy,
             artifact_url_base=args.artifact_url_base,
             skip_smoke=args.skip_smoke,
+            node_major=args.node_major,
         )
     except PackBuildError as exc:
         parser.error(str(exc))

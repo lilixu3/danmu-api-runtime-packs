@@ -2,6 +2,12 @@ name: Publish upstream Android runtime pack
 
 on:
   workflow_dispatch:
+    inputs:
+      force:
+        description: "Rebuild and replace the pack for the current upstream SHA"
+        required: false
+        default: false
+        type: boolean
   schedule:
     - cron: "*/15 * * * *"
 
@@ -19,6 +25,7 @@ jobs:
     env:
       UPSTREAM_CORE_REPO: huangxd-/danmu_api
       UPSTREAM_CORE_URL: https://github.com/huangxd-/danmu_api.git
+      FORCE_PUBLISH: ${{ inputs.force || false }}
     steps:
       - name: Checkout pack repository
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
@@ -28,7 +35,7 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 22
+          node-version: 18.20.4
           check-latest: false
 
       - name: Run pack-generator tests
@@ -44,7 +51,8 @@ jobs:
             echo "官方上游 main 未返回完整 commit SHA" >&2
             exit 1
           fi
-          if [[ -f index.json ]] && jq -e --arg sha "$sha" '.entries[$sha] != null' index.json >/dev/null; then
+          if [[ -f index.json ]] && jq -e --arg sha "$sha" '.entries[$sha] != null' index.json >/dev/null \
+            && [[ "$FORCE_PUBLISH" != "true" ]]; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -78,6 +86,7 @@ jobs:
             --core-sha "${{ steps.upstream.outputs.sha }}" \
             --output-dir dist \
             --policy policy.json \
+            --node-major 18 \
             --artifact-url-base "https://github.com/${GITHUB_REPOSITORY}/releases/download/core-${{ steps.upstream.outputs.short }}"
           jq -e --arg sha "${{ steps.upstream.outputs.sha }}" \
             '(.coreRepo == "huangxd-/danmu_api") and (.coreSha == $sha) and (.artifactSha256 | test("^[0-9a-f]{64}$"))' \
@@ -109,7 +118,11 @@ jobs:
         run: |
           set -euo pipefail
           test -n "$RUNTIME_PACK_SIGNING_PRIVATE_KEY"
-          python3 -m scripts.update_index --index index.json --entry dist/entry.json > /dev/null
+          update_args=(--index index.json --entry dist/entry.json)
+          if [[ "$FORCE_PUBLISH" == "true" ]]; then
+            update_args+=(--replace)
+          fi
+          python3 -m scripts.update_index "${update_args[@]}" > /dev/null
           key="$RUNNER_TEMP/runtime-pack-signing-key.pem"
           sig="$RUNNER_TEMP/index.sig.bin"
           umask 077
