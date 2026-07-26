@@ -58,6 +58,35 @@ The App verifies the exact signed index bytes, channel, source repository and
 branch, archive URL/size/SHA-256, manifest, Node major, dependency fingerprint,
 runtime lock, package list, and every extracted file hash.
 
+## Index freshness and revocation
+
+Each channel index carries a monotonically increasing `serial` that advances on
+every publish. The App records the highest serial it has accepted per channel and
+refuses anything lower, so a proxy cannot replay an older but still validly signed
+`index.json` + `index.sig` pair to steer an install onto a superseded pack.
+
+The index keeps only the 20 most recently published entries. Trimmed packs remain
+downloadable through their immutable Release assets but stop being resolvable by
+dependency fingerprint.
+
+To withdraw a published pack:
+
+```bash
+python3 -m scripts.revoke_index_entry \
+  --index stable/index.json \
+  --channel stable \
+  --core-sha <full-sha>
+```
+
+This drops the entry and its fingerprint mapping, records the SHA under `revoked`
+so a later build cannot silently reintroduce it, and bumps the serial. The index
+must be re-signed afterwards.
+
+Never rebuild a channel index from scratch. The serial restarts at 1 and every App
+that already accepted a higher serial will reject the channel permanently. To
+recover from a corrupted index, edit it in place and keep the serial ahead of the
+last published value.
+
 ## Policies
 
 Channel policy files live under:

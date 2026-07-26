@@ -8,6 +8,7 @@ from pathlib import Path
 from scripts.build_runtime_pack import (
     EMBEDDED_NODE_MAJOR,
     INDEX_SCHEMA,
+    MAX_INDEX_ENTRIES,
     TRUSTED_CHANNELS,
     PackBuildError,
     UPSTREAM_CORE_REPO,
@@ -19,6 +20,7 @@ from scripts.build_runtime_pack import (
     filter_android_dependencies,
     merge_index_entry,
     new_channel_index,
+    revoke_index_entry,
     sha256_file,
     source_dependencies,
     trusted_channel,
@@ -254,6 +256,62 @@ class BuildRuntimePackTest(unittest.TestCase):
         result = merge_index_entry(index, new, channel="stable", replace=True)
         self.assertEqual(new, result["entries"][sha])
         self.assertEqual(sha, result["dependencyEntries"][fingerprint])
+
+    @staticmethod
+    def _stable_entry(index: int) -> dict:
+        return {
+            "channel": "stable",
+            "coreRepo": UPSTREAM_CORE_REPO,
+            "coreBranch": "main",
+            "coreSha": f"{index:040x}",
+            "dependencyFingerprint": f"{index:064x}",
+        }
+
+    def test_index_serial_advances_on_every_publish(self):
+        index = new_channel_index("stable")
+        self.assertEqual(0, index["serial"])
+        first = merge_index_entry(index, self._stable_entry(1), channel="stable")
+        self.assertEqual(1, first["serial"])
+        self.assertEqual(1, first["entrySerials"][f"{1:040x}"])
+        second = merge_index_entry(first, self._stable_entry(2), channel="stable")
+        self.assertEqual(2, second["serial"])
+        # Republishing an unchanged entry must still move the serial forward so
+        # the App never sees the same value carry two different index bodies.
+        replayed = merge_index_entry(
+            second, self._stable_entry(2), channel="stable", replace=True
+        )
+        self.assertEqual(3, replayed["serial"])
+
+    def test_index_keeps_only_the_most_recent_entries(self):
+        index = new_channel_index("stable")
+        for number in range(1, MAX_INDEX_ENTRIES + 4):
+            index = merge_index_entry(index, self._stable_entry(number), channel="stable")
+        self.assertEqual(MAX_INDEX_ENTRIES, len(index["entries"]))
+        self.assertEqual(MAX_INDEX_ENTRIES, len(index["entrySerials"]))
+        self.assertNotIn(f"{1:040x}", index["entries"])
+        self.assertIn(f"{MAX_INDEX_ENTRIES + 3:040x}", index["entries"])
+        # Fingerprint mappings must never outlive the entry they point at.
+        self.assertEqual(
+            set(index["entries"]),
+            set(index["dependencyEntries"].values()),
+        )
+        self.assertNotIn(f"{1:064x}", index["dependencyEntries"])
+
+    def test_revoked_entry_is_removed_and_cannot_be_republished(self):
+        index = merge_index_entry(
+            new_channel_index("stable"), self._stable_entry(1), channel="stable"
+        )
+        index = merge_index_entry(index, self._stable_entry(2), channel="stable")
+        revoked = revoke_index_entry(index, f"{1:040X}", channel="stable")
+        self.assertEqual([f"{1:040x}"], revoked["revoked"])
+        self.assertNotIn(f"{1:040x}", revoked["entries"])
+        self.assertNotIn(f"{1:064x}", revoked["dependencyEntries"])
+        self.assertIn(f"{2:040x}", revoked["entries"])
+        self.assertEqual(index["serial"] + 1, revoked["serial"])
+        with self.assertRaises(PackBuildError):
+            merge_index_entry(revoked, self._stable_entry(1), channel="stable")
+        with self.assertRaises(PackBuildError):
+            revoke_index_entry(revoked, "not-a-sha", channel="stable")
 
     def test_merge_index_rejects_entry_without_dependency_fingerprint(self):
         with self.assertRaises(PackBuildError):

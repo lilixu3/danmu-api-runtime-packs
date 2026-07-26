@@ -27,6 +27,9 @@ UPSTREAM_CORE_REPO = "huangxd-/danmu_api"  # Legacy stable-index compatibility.
 RUNTIME_PROTOCOL = 1
 INDEX_SCHEMA = 2
 EMBEDDED_NODE_MAJOR = 18
+# Older packs stay downloadable through their immutable Release assets; the
+# index only has to carry the window an installed App may still resolve against.
+MAX_INDEX_ENTRIES = 20
 TRUSTED_CHANNELS: dict[str, dict[str, str]] = {
     "stable": {
         "repo": "huangxd-/danmu_api",
@@ -330,9 +333,97 @@ def new_channel_index(channel: str) -> dict[str, Any]:
         "schema": INDEX_SCHEMA,
         "channel": source["channel"],
         "source": {"repo": source["repo"], "branch": source["branch"]},
+        "serial": 0,
         "entries": {},
+        "entrySerials": {},
         "dependencyEntries": {},
+        "revoked": [],
     }
+
+
+def _normalize_core_sha(core_sha: str, message: str) -> str:
+    normalized = str(core_sha or "").strip().lower()
+    if not re.fullmatch(r"[0-9a-f]{40}", normalized):
+        raise PackBuildError(f"{message}：{core_sha}")
+    return normalized
+
+
+def _rebuild_dependency_entries(
+    entries: dict[str, Any], dependency_entries: dict[str, str]
+) -> dict[str, str]:
+    """Drop fingerprint mappings whose target entry no longer exists."""
+
+    return {
+        fingerprint: core_sha
+        for fingerprint, core_sha in dependency_entries.items()
+        if core_sha in entries
+    }
+
+
+def _trim_index(result: dict[str, Any], keep: int = MAX_INDEX_ENTRIES) -> None:
+    """Bound index growth so every App install keeps paying a small download.
+
+    Entries are ordered by the index serial they were published under, so the
+    most recently published packs survive. Trimmed packs stay reachable through
+    their immutable Release assets; they merely stop being resolvable by
+    fingerprint, which is what an App running a years-old core would need.
+    """
+
+    entries = dict(result.get("entries") or {})
+    if len(entries) <= keep:
+        return
+    serials = dict(result.get("entrySerials") or {})
+    ordered = sorted(entries, key=lambda sha: (int(serials.get(sha, 0)), sha), reverse=True)
+    survivors = set(ordered[:keep])
+    result["entries"] = {sha: entry for sha, entry in sorted(entries.items()) if sha in survivors}
+    result["entrySerials"] = dict(
+        sorted((sha, serial) for sha, serial in serials.items() if sha in survivors)
+    )
+    result["dependencyEntries"] = dict(
+        sorted(
+            _rebuild_dependency_entries(
+                result["entries"], dict(result.get("dependencyEntries") or {})
+            ).items()
+        )
+    )
+
+
+def revoke_index_entry(index: dict[str, Any], core_sha: str, *, channel: str) -> dict[str, Any]:
+    """Withdraw one published pack from the channel index.
+
+    Removing the entry is what actually stops installs; the ``revoked`` list
+    keeps a later build of the same core SHA from silently reintroducing it. The
+    App refuses an index whose serial went backwards, so a proxy cannot replay
+    the pre-revocation index to undo this.
+    """
+
+    source = trusted_channel(channel)
+    normalized = _normalize_core_sha(core_sha, "吊销目标不是完整 40 位 commit SHA")
+    result = dict(index) if isinstance(index, dict) and index else new_channel_index(channel)
+    if result.get("schema") != INDEX_SCHEMA:
+        raise PackBuildError("现有索引协议版本不受支持")
+    if result.get("channel") != source["channel"]:
+        raise PackBuildError("现有索引通道不匹配")
+
+    entries = {sha: entry for sha, entry in (result.get("entries") or {}).items() if sha != normalized}
+    result["entries"] = dict(sorted(entries.items()))
+    result["entrySerials"] = dict(
+        sorted(
+            (sha, serial)
+            for sha, serial in (result.get("entrySerials") or {}).items()
+            if sha in entries
+        )
+    )
+    result["dependencyEntries"] = dict(
+        sorted(
+            _rebuild_dependency_entries(
+                entries, dict(result.get("dependencyEntries") or {})
+            ).items()
+        )
+    )
+    result["revoked"] = sorted(set(result.get("revoked") or []) | {normalized})
+    result["serial"] = int(result.get("serial") or 0) + 1
+    return result
 
 
 def merge_index_entry(
@@ -350,9 +441,7 @@ def merge_index_entry(
     )
     if str(entry.get("channel") or "") != source["channel"]:
         raise PackBuildError("依赖包 entry 通道与目标索引不一致")
-    core_sha = str(entry.get("coreSha") or "").lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", core_sha):
-        raise PackBuildError(f"索引 entry 缺少完整核心 SHA：{core_sha}")
+    core_sha = _normalize_core_sha(entry.get("coreSha"), "索引 entry 缺少完整核心 SHA")
     fingerprint = str(entry.get("dependencyFingerprint") or "").lower()
     if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
         raise PackBuildError(f"索引 entry 缺少有效依赖指纹：{fingerprint}")
@@ -365,6 +454,8 @@ def merge_index_entry(
     expected_source = {"repo": source["repo"], "branch": source["branch"]}
     if result.get("source") != expected_source:
         raise PackBuildError("现有索引来源与受信任通道不匹配")
+    if core_sha in set(result.get("revoked") or []):
+        raise PackBuildError(f"该核心 SHA 已被吊销，不能重新收录：{core_sha}")
 
     entries = dict(result.get("entries") or {})
     previous = entries.get(core_sha)
@@ -375,6 +466,16 @@ def merge_index_entry(
     dependency_entries = dict(result.get("dependencyEntries") or {})
     dependency_entries[fingerprint] = core_sha
     result["dependencyEntries"] = dict(sorted(dependency_entries.items()))
+    # A monotonic serial lets the App reject a replayed older signed index. It
+    # advances on every publish, including a --replace of an unchanged entry, so
+    # it never repeats a value the App has already accepted.
+    serial = int(result.get("serial") or 0) + 1
+    result["serial"] = serial
+    entry_serials = dict(result.get("entrySerials") or {})
+    entry_serials[core_sha] = serial
+    result["entrySerials"] = dict(sorted(entry_serials.items()))
+    result.setdefault("revoked", [])
+    _trim_index(result)
     return result
 
 

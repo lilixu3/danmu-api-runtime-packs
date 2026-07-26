@@ -253,11 +253,19 @@ jobs:
           set -euo pipefail
           test -n "$RUNTIME_PACK_SIGNING_PRIVATE_KEY"
           mkdir -p "$CHANNEL"
+          previous_serial=0
+          if [[ -f "$CHANNEL/index.json" ]]; then
+            previous_serial="$(jq -r '.serial // 0' "$CHANNEL/index.json")"
+          fi
           update_args=(--index "$CHANNEL/index.json" --entry dist/entry.json --channel "$CHANNEL")
           if [[ "$FORCE_PUBLISH" == "true" ]]; then
             update_args+=(--replace)
           fi
           python3 -m scripts.update_index "${update_args[@]}" > /dev/null
+          # The App rejects an index whose serial went backwards, so a stalled or
+          # reused serial would silently freeze every future publish.
+          jq -e --argjson previous "$previous_serial" '.serial > $previous' \
+            "$CHANNEL/index.json" >/dev/null
           if [[ "$CHANNEL" == "stable" ]]; then
             python3 -m scripts.update_legacy_index \
               --index index.json \
