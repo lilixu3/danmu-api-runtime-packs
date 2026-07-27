@@ -1,10 +1,10 @@
-name: Publish shared Android runtime dependencies
+name: 发布 Android 公共运行时依赖
 
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild and republish the current locked dependency closure"
+        description: "强制重新校验、签名并发布当前锁定依赖"
         required: false
         default: false
         type: boolean
@@ -28,6 +28,7 @@ concurrency:
 
 jobs:
   build:
+    name: 构建与校验
     runs-on: ubuntu-latest
     timeout-minutes: 25
     permissions:
@@ -36,29 +37,29 @@ jobs:
       publish: ${{ steps.state.outputs.publish }}
       serial: ${{ steps.state.outputs.serial }}
     steps:
-      - name: Checkout pack repository without write credentials
+      - name: 检出依赖仓库（不保留写入凭据）
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: Set up Node.js
+      - name: 配置 Node.js 18
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 18.20.4
           check-latest: false
 
-      - name: Run builder tests
+      - name: 运行构建器测试
         run: python3 -m unittest discover -s tests -v
 
-      - name: Checkout both trusted core heads
+      - name: 检出稳定版和开发版核心
         shell: bash
         run: |
           set -euo pipefail
           git clone --depth 1 --branch main https://github.com/huangxd-/danmu_api.git "$RUNNER_TEMP/stable-core"
           git clone --depth 1 --branch main https://github.com/lilixu3/danmu_api.git "$RUNNER_TEMP/dev-core"
 
-      - name: Verify shared runtime covers both cores
+      - name: 校验公共依赖是否覆盖两个核心
         shell: bash
         run: |
           set -euo pipefail
@@ -68,7 +69,7 @@ jobs:
             --dev-core-dir "$RUNNER_TEMP/dev-core" \
             --validate-only
 
-      - name: Decide whether the locked closure changed
+      - name: 判断依赖或核心版本是否变化
         id: state
         env:
           FORCE_PUBLISH: ${{ inputs.force || false }}
@@ -76,13 +77,22 @@ jobs:
         run: |
           set -euo pipefail
           lock_sha="$(sha256sum runtime/package-lock.json | awk '{print $1}')"
+          stable_version="$(python3 -c 'import sys; from pathlib import Path; from scripts.build_runtime_pack import read_core_version; print(read_core_version(Path(sys.argv[1])))' "$RUNNER_TEMP/stable-core")"
+          dev_version="$(python3 -c 'import sys; from pathlib import Path; from scripts.build_runtime_pack import read_core_version; print(read_core_version(Path(sys.argv[1])))' "$RUNNER_TEMP/dev-core")"
           previous_serial=0
           current_lock=""
+          current_stable_version=""
+          current_dev_version=""
           if [[ -f manifest.json ]]; then
             previous_serial="$(jq -r '.serial // 0' manifest.json)"
             current_lock="$(jq -r '.runtimeLockSha256 // ""' manifest.json)"
+            current_stable_version="$(jq -r '.coreVersions.stable // ""' manifest.json)"
+            current_dev_version="$(jq -r '.coreVersions.dev // ""' manifest.json)"
           fi
-          if [[ "$FORCE_PUBLISH" != "true" && "$current_lock" == "$lock_sha" ]]; then
+          if [[ "$FORCE_PUBLISH" != "true" &&
+                "$current_lock" == "$lock_sha" &&
+                "$current_stable_version" == "$stable_version" &&
+                "$current_dev_version" == "$dev_version" ]]; then
             publish=false
           else
             publish=true
@@ -92,7 +102,7 @@ jobs:
             echo "serial=$((previous_serial + 1))"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Build and smoke-test node_modules.zip
+      - name: 构建并启动测试 node_modules.zip
         if: steps.state.outputs.publish == 'true'
         shell: bash
         run: |
@@ -109,12 +119,14 @@ jobs:
           test -f dist/node_modules.zip
           jq -e \
             '(.schema == 3) and (.runtimeProtocol == 2) and (.nodeMajor == 18) and
+             (.coreVersions.stable | test("^[0-9]+(\\.[0-9]+)+")) and
+             (.coreVersions.dev | test("^[0-9]+(\\.[0-9]+)+")) and
              (.artifactUrl | endswith("/node_modules.zip")) and
              (.artifactSha256 | test("^[0-9a-f]{64}$")) and
              (.artifactSize > 0) and (.packages | length > 0)' \
             dist/manifest.json >/dev/null
 
-      - name: Upload verified output
+      - name: 上传已校验的构建结果
         if: steps.state.outputs.publish == 'true'
         uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
         with:
@@ -124,6 +136,7 @@ jobs:
           retention-days: 1
 
   publish:
+    name: 发布与签名
     needs: build
     if: needs.build.outputs.publish == 'true'
     runs-on: ubuntu-latest
@@ -131,29 +144,38 @@ jobs:
     permissions:
       contents: write
     steps:
-      - name: Checkout selected repository branch
+      - name: 检出目标分支
         uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           fetch-depth: 0
           ref: ${{ github.ref_name }}
 
-      - name: Download verified build output
+      - name: 下载已校验的构建结果
         uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
         with:
           name: shared-runtime-dependencies
           path: dist
 
-      - name: Publish immutable node_modules.zip release
+      - name: 发布不可变的 node_modules.zip
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
           archive_sha="$(jq -r '.artifactSha256' dist/manifest.json)"
+          stable_version="$(jq -r '.coreVersions.stable' dist/manifest.json)"
+          dev_version="$(jq -r '.coreVersions.dev' dist/manifest.json)"
           tag="runtime-dependencies-${archive_sha:0:12}"
           expected_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/node_modules.zip"
           test "$(jq -r '.artifactUrl' dist/manifest.json)" = "$expected_url"
           test "$(sha256sum dist/node_modules.zip | awk '{print $1}')" = "$archive_sha"
+          if [[ "$stable_version" == "$dev_version" ]]; then
+            release_title="$stable_version"
+            release_notes="适用于稳定版和开发版核心 $stable_version 的 Android 运行时依赖。"
+          else
+            release_title="稳定版 $stable_version / 开发版 $dev_version"
+            release_notes="适用于稳定版核心 $stable_version 和开发版核心 $dev_version 的 Android 运行时依赖。"
+          fi
           if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             existing_dir="$(mktemp -d)"
             trap 'rm -rf "$existing_dir"' EXIT
@@ -162,14 +184,18 @@ jobs:
               --pattern node_modules.zip \
               --dir "$existing_dir"
             cmp --silent dist/node_modules.zip "$existing_dir/node_modules.zip"
+            gh release edit "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$release_title" \
+              --notes "$release_notes"
           else
             gh release create "$tag" dist/node_modules.zip \
               --repo "$GITHUB_REPOSITORY" \
-              --title "Android runtime dependencies ${archive_sha:0:12}" \
-              --notes "Single locked pure-JavaScript node_modules closure for stable and development cores."
+              --title "$release_title" \
+              --notes "$release_notes"
           fi
 
-      - name: Sign the exact manifest bytes
+      - name: 签名清单原始字节
         env:
           RUNTIME_PACK_SIGNING_PRIVATE_KEY: ${{ secrets.RUNTIME_PACK_SIGNING_PRIVATE_KEY }}
         shell: bash
@@ -186,7 +212,7 @@ jobs:
             -signature "$signature" dist/manifest.json
           rm -f "$key" "$signature"
 
-      - name: Commit signed current manifest
+      - name: 提交当前签名清单
         env:
           TARGET_BRANCH: ${{ github.ref_name }}
         shell: bash
@@ -202,6 +228,12 @@ jobs:
             echo "签名清单无变化，无需提交。"
             exit 0
           fi
-          short="$(jq -r '.artifactSha256[0:12]' manifest.json)"
-          git commit -m "发布公共运行时依赖 $short"
+          stable_version="$(jq -r '.coreVersions.stable' manifest.json)"
+          dev_version="$(jq -r '.coreVersions.dev' manifest.json)"
+          if [[ "$stable_version" == "$dev_version" ]]; then
+            version_label="$stable_version"
+          else
+            version_label="$stable_version / $dev_version"
+          fi
+          git commit -m "发布运行时依赖 $version_label"
           git push origin "HEAD:$TARGET_BRANCH"

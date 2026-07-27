@@ -16,6 +16,7 @@ from scripts.build_runtime_pack import (
     canonical_json_bytes,
     collect_package_records,
     dependency_fingerprint,
+    read_core_version,
     source_dependencies,
     validate_core_coverage,
     validate_lockfile,
@@ -184,6 +185,7 @@ class RuntimePackBuilderTest(unittest.TestCase):
                 node_major=18,
                 runtime_lock=lock,
                 dependencies=dependencies,
+                core_versions={"stable": "1.20.0", "dev": "1.20.0"},
                 archive=archive,
                 package_records=[
                     {
@@ -198,6 +200,10 @@ class RuntimePackBuilderTest(unittest.TestCase):
         self.assertEqual(MANIFEST_SCHEMA, manifest["schema"])
         self.assertEqual(RUNTIME_PROTOCOL, manifest["runtimeProtocol"])
         self.assertEqual(7, manifest["serial"])
+        self.assertEqual(
+            {"stable": "1.20.0", "dev": "1.20.0"},
+            manifest["coreVersions"],
+        )
         self.assertNotIn("channel", manifest)
         self.assertNotIn("entries", manifest)
         self.assertNotIn("files", manifest)
@@ -210,6 +216,16 @@ class RuntimePackBuilderTest(unittest.TestCase):
             manifest,
             json.loads(canonical_json_bytes(manifest).decode("utf-8")),
         )
+
+    def test_reads_version_from_core_globals(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            core = Path(tmp)
+            globals_js = core / "danmu_api" / "configs" / "globals.js"
+            globals_js.parent.mkdir(parents=True)
+            globals_js.write_text("export default { VERSION: '1.20.0' };\n", encoding="utf-8")
+            (core / "package.json").write_text('{"version":"1.0.0"}', encoding="utf-8")
+
+            self.assertEqual("1.20.0", read_core_version(core))
 
 
 if __name__ == "__main__":

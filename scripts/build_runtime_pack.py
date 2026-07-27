@@ -1,4 +1,4 @@
-"""Build the single signed Android node_modules runtime pack."""
+"""构建供 DanmuApiApp 使用的单一签名 node_modules 运行时依赖包。"""
 
 from __future__ import annotations
 
@@ -24,10 +24,12 @@ _DISALLOWED_INSTALL_SCRIPTS = {"preinstall", "install", "postinstall"}
 _NATIVE_SUFFIXES = {".node", ".so", ".dylib", ".dll"}
 _NATIVE_FILENAMES = {"binding.gyp", "binding.cc", "binding.c", "binding.cpp"}
 _SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$")
+_CORE_VERSION = re.compile(r"^v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$")
+_GLOBALS_VERSION = re.compile(r"\bVERSION\s*:\s*(['\"])([^'\"]+)\1")
 
 
 class PackBuildError(RuntimeError):
-    """Raised when the shared pure-JavaScript runtime cannot be published."""
+    """公共纯 JavaScript 运行时无法安全发布。"""
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -66,6 +68,35 @@ def sha256_file(path: Path) -> str:
 
 def dependency_fingerprint(dependencies: dict[str, str]) -> str:
     return sha256_bytes(canonical_json_bytes(dict(sorted(dependencies.items()))))
+
+
+def read_core_version(core_dir: Path) -> str:
+    candidates = (
+        core_dir / "danmu_api/configs/globals.js",
+        core_dir / "danmu-api/configs/globals.js",
+        core_dir / "configs/globals.js",
+        core_dir / "config/globals.js",
+        core_dir / "globals.js",
+    )
+    for candidate in candidates:
+        if not candidate.is_file():
+            continue
+        try:
+            content = candidate.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise PackBuildError(f"无法读取核心版本：{candidate}") from exc
+        match = _GLOBALS_VERSION.search(content)
+        if match:
+            version = match.group(2).strip()
+            if not _CORE_VERSION.fullmatch(version):
+                raise PackBuildError(f"核心版本格式无效：{version}")
+            return version.removeprefix("v")
+
+    package_json = read_json(core_dir / "package.json")
+    version = str(package_json.get("version") or "").strip() if isinstance(package_json, dict) else ""
+    if not _CORE_VERSION.fullmatch(version):
+        raise PackBuildError(f"无法识别核心版本：{core_dir}")
+    return version.removeprefix("v")
 
 
 def _validate_registry_dependency_spec(name: str, spec: str) -> None:
@@ -334,6 +365,7 @@ def build_manifest(
     node_major: int,
     runtime_lock: Path,
     dependencies: dict[str, str],
+    core_versions: dict[str, str],
     archive: Path,
     package_records: list[dict[str, Any]],
     repository: str = PACK_REPO,
@@ -350,6 +382,7 @@ def build_manifest(
         "runtimeLockSha256": sha256_file(runtime_lock),
         "dependencyFingerprint": dependency_fingerprint(dependencies),
         "dependencies": dependencies,
+        "coreVersions": core_versions,
         "artifactUrl": (
             f"https://github.com/{repository}/releases/download/{tag}/node_modules.zip"
         ),
@@ -362,7 +395,7 @@ def build_manifest(
 def validate_runtime_definition(
     runtime_dir: Path,
     core_dirs: dict[str, Path],
-) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str], dict[str, str]]:
     if set(core_dirs) != set(TRUSTED_CORE_LABELS):
         raise PackBuildError("必须同时校验 stable 与 dev 核心")
     runtime_package = read_json(runtime_dir / "package.json")
@@ -376,12 +409,14 @@ def validate_runtime_definition(
         if _parse_version(spec) is None:
             raise PackBuildError(f"公共运行时必须锁定精确版本：{name}@{spec}")
     validate_lockfile(runtime_lock, dependencies)
+    core_versions: dict[str, str] = {}
     for label, core_dir in core_dirs.items():
         core_package = read_json(core_dir / "package.json")
         if not isinstance(core_package, dict):
             raise PackBuildError(f"{label}核心 package.json 格式无效")
         validate_core_coverage(core_package, runtime_package, label)
-    return runtime_package, runtime_lock, dependencies
+        core_versions[label] = read_core_version(core_dir)
+    return runtime_package, runtime_lock, dependencies, core_versions
 
 
 def build_pack(
@@ -396,7 +431,10 @@ def build_pack(
 ) -> dict[str, Any]:
     if serial <= 0:
         raise PackBuildError("manifest serial 必须大于 0")
-    _, runtime_lock, dependencies = validate_runtime_definition(runtime_dir, core_dirs)
+    _, runtime_lock, dependencies, core_versions = validate_runtime_definition(
+        runtime_dir,
+        core_dirs,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     archive_path = output_dir / "node_modules.zip"
@@ -438,6 +476,7 @@ def build_pack(
         node_major=node_major,
         runtime_lock=runtime_dir / "package-lock.json",
         dependencies=dependencies,
+        core_versions=core_versions,
         archive=archive_path,
         package_records=package_records,
         repository=repository,
@@ -462,7 +501,7 @@ def main() -> int:
     try:
         if args.validate_only:
             validate_runtime_definition(args.runtime_dir, core_dirs)
-            print("stable/dev 核心依赖均已被公共运行时覆盖")
+            print("稳定版和开发版核心依赖均已被公共运行时覆盖")
             return 0
         manifest = build_pack(
             runtime_dir=args.runtime_dir,

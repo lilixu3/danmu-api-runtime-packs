@@ -1,11 +1,11 @@
-# DanmuApiApp Android Runtime Dependencies
+# DanmuApiApp Android 运行时依赖
 
-This repository publishes one shared, pure-JavaScript `node_modules.zip` for
-the stable and development cores used by DanmuApiApp.
+本仓库为 DanmuApiApp 发布一个稳定版和开发版共用的纯 JavaScript
+`node_modules.zip`。仓库不保存核心源码，也不执行核心中的安装脚本。
 
-## Published files
+## 发布内容
 
-The current signed metadata is kept at the repository root:
+仓库根目录只保留当前版本的签名元数据：
 
 ```text
 manifest.json
@@ -13,16 +13,17 @@ manifest.sig
 runtime-pack-public-key.pem
 ```
 
-`manifest.json` points to one immutable GitHub Release asset named
-`node_modules.zip`. The ZIP contains exactly one top-level `node_modules/`
-directory. The App verifies the manifest signature, protocol and Node version,
-then verifies the archive size and SHA-256 before extraction.
+`manifest.json` 指向 GitHub Release 中不可变的 `node_modules.zip`。压缩包只有
+一个顶层 `node_modules/` 目录。Release 标题直接使用对应核心版本号；稳定版和
+开发版版本不同时，会同时显示两个版本。
 
-## Dependency source
+App 会依次校验清单签名、协议版本、Node.js 主版本、压缩包大小和 SHA-256，
+全部通过后才会解压并安装。清单序号只增不减，用于拒绝旧清单回放。
 
-`runtime/package.json` is the canonical Android runtime allowlist and uses exact
-versions. `runtime/package-lock.json` pins the complete transitive closure. The
-current direct dependencies are:
+## 依赖来源
+
+`runtime/package.json` 是 Android 运行时直接依赖清单，全部使用精确版本；
+`runtime/package-lock.json` 固定完整传递依赖闭包。当前直接依赖如下：
 
 - `@dan-uni/dan-any`
 - `brotli`
@@ -31,23 +32,27 @@ current direct dependencies are:
 - `opencc-js`
 - `pako`
 
-The publish workflow checks both `huangxd-/danmu_api@main` and
-`lilixu3/danmu_api@main`. It fails if either core adds a required dependency not
-covered by the common runtime. Android-non-runtime dependencies `chokidar`,
-`dotenv`, `esbuild`, and optional `redis` are intentionally excluded.
+发布工作流会同时检查以下两个核心的 `main` 分支：
 
-## Security checks
+- 稳定版：`huangxd-/danmu_api`
+- 开发版：`lilixu3/danmu_api`
 
-The builder rejects install lifecycle scripts, native binaries, platform-bound
-packages, prebuild directories, symbolic links, and non-registry dependency
-specifications. Both core `worker.js` entry points are smoke-tested with the
-locked dependency closure before publishing.
+任一核心新增未覆盖的运行时依赖都会使发布失败。仅用于服务端监听、构建或可选
+缓存的 `chokidar`、`dotenv`、`esbuild` 和 `redis` 不进入 Android 依赖包。
 
-The private signing key is available only to the publish job. The App embeds
-`runtime-pack-public-key.pem` and accepts only the exact signed manifest bytes.
-The manifest carries a monotonically increasing serial to reject rollback.
+## 安全校验
 
-## Local verification
+构建器会拒绝以下内容：
+
+- `preinstall`、`install`、`postinstall` 安装脚本；
+- `.node`、`.so`、`.dll`、`.dylib` 等原生文件；
+- 带操作系统、CPU 或 libc 限制的包；
+- `prebuilds`、符号链接和非 npm registry 依赖。
+
+发布前会使用锁定依赖分别启动测试两个核心的 `worker.js`。私钥只提供给独立的
+签名发布任务，构建任务没有仓库写权限和签名私钥。
+
+## 本地校验
 
 ```bash
 python3 -m unittest discover -s tests -v
@@ -60,4 +65,4 @@ python3 scripts/build_runtime_pack.py \
   --node-major 18
 ```
 
-The generated `dist/node_modules.zip` is deterministic for a fixed lockfile.
+锁文件不变时，生成的 `dist/node_modules.zip` 字节内容和 SHA-256 保持一致。
