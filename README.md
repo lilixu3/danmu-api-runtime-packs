@@ -1,138 +1,63 @@
-# danmu-api Android Runtime Packs
+# DanmuApiApp Android Runtime Dependencies
 
-This repository publishes **derived Android pure-JavaScript runtime dependency
-packs** for the Danmu App. It does not mirror or modify either core repository.
+This repository publishes one shared, pure-JavaScript `node_modules.zip` for
+the stable and development cores used by DanmuApiApp.
 
-## Trusted channels
+## Published files
 
-Only these exact sources are accepted:
-
-| Channel | Repository | Branch | Signed index |
-|---|---|---|---|
-| `stable` | `huangxd-/danmu_api` | `main` | `stable/index.json` + `stable/index.sig` |
-| `dev` | `lilixu3/danmu_api` | `main` | `dev/index.json` + `dev/index.sig` |
-
-The builder accepts only `--channel stable` or `--channel dev`; repository and
-branch values come from its hard-coded allowlist. Arbitrary custom repositories
-are never cloned or packaged by the signing pipeline.
-
-The root `index.json` and `index.sig` remain a schema-1 **stable compatibility
-index** for older App versions. Stable schema-2 output is converted into a distinct
-schema-1 manifest/ZIP and all archive and manifest hashes are recomputed before that
-legacy index is signed. Development packs never enter the legacy index.
-
-## Channel isolation
-
-Stable and development packs are intentionally separate even when both core
-commits currently have the same dependency fingerprint. Each signed index,
-entry, manifest, Release tag, and asset carries the channel and exact source:
+The current signed metadata is kept at the repository root:
 
 ```text
-stable-core-<sha12>/runtime-pack-stable-<sha12>.zip
-dev-core-<sha12>/runtime-pack-dev-<sha12>.zip
+manifest.json
+manifest.sig
+runtime-pack-public-key.pem
 ```
 
-The new App reads only the index matching its selected built-in core variant.
-There is no stable-to-dev, dev-to-stable, or custom-core fallback. If a matching
-signed pack is unavailable, the App aborts before live-core replacement and
-keeps the old core.
+`manifest.json` points to one immutable GitHub Release asset named
+`node_modules.zip`. The ZIP contains exactly one top-level `node_modules/`
+directory. The App verifies the manifest signature, protocol and Node version,
+then verifies the archive size and SHA-256 before extraction.
 
-## Security boundary
+## Dependency source
 
-Resolution and `worker.js` smoke run under Node.js 18.20.4 in a read-only build
-job without the signing private key or repository write credentials. A separate
-publish job receives only the verified output, publishes the immutable Release
-asset, updates the selected channel index, and signs it. If a same-SHA Release
-already exists, the job downloads it and requires byte-for-byte equality; a
-mismatch fails before the index is changed, and `--clobber` is forbidden.
+`runtime/package.json` is the canonical Android runtime allowlist and uses exact
+versions. `runtime/package-lock.json` pins the complete transitive closure. The
+current direct dependencies are:
 
-The builder rejects:
+- `@dan-uni/dan-any`
+- `brotli`
+- `https-proxy-agent`
+- `node-fetch`
+- `opencc-js`
+- `pako`
 
-- `preinstall`, `install`, or `postinstall` lifecycle scripts;
-- `.node`, `.so`, `.dll`, `.dylib`, `binding.gyp`, and prebuilt binaries;
-- `os`, `cpu`, or `libc` constrained packages;
-- package-internal symbolic links;
-- Git/file/http/workspace/link/npm-alias or shorthand Git dependency specs.
+The publish workflow checks both `huangxd-/danmu_api@main` and
+`lilixu3/danmu_api@main`. It fails if either core adds a required dependency not
+covered by the common runtime. Android-non-runtime dependencies `chokidar`,
+`dotenv`, `esbuild`, and optional `redis` are intentionally excluded.
 
-The App verifies the exact signed index bytes, channel, source repository and
-branch, archive URL/size/SHA-256, manifest, Node major, dependency fingerprint,
-runtime lock, package list, and every extracted file hash.
+## Security checks
 
-## Index freshness and revocation
+The builder rejects install lifecycle scripts, native binaries, platform-bound
+packages, prebuild directories, symbolic links, and non-registry dependency
+specifications. Both core `worker.js` entry points are smoke-tested with the
+locked dependency closure before publishing.
 
-Each channel index carries a monotonically increasing `serial` that advances on
-every publish. The App records the highest serial it has accepted per channel and
-refuses anything lower, so a proxy cannot replay an older but still validly signed
-`index.json` + `index.sig` pair to steer an install onto a superseded pack.
+The private signing key is available only to the publish job. The App embeds
+`runtime-pack-public-key.pem` and accepts only the exact signed manifest bytes.
+The manifest carries a monotonically increasing serial to reject rollback.
 
-The index keeps only the 20 most recently published entries. Trimmed packs remain
-downloadable through their immutable Release assets but stop being resolvable by
-dependency fingerprint.
-
-To withdraw a published pack:
-
-```bash
-python3 -m scripts.revoke_index_entry \
-  --index stable/index.json \
-  --channel stable \
-  --core-sha <full-sha>
-```
-
-This drops the entry and its fingerprint mapping, records the SHA under `revoked`
-so a later build cannot silently reintroduce it, and bumps the serial. The index
-must be re-signed afterwards.
-
-Never rebuild a channel index from scratch. The serial restarts at 1 and every App
-that already accepted a higher serial will reject the channel permanently. To
-recover from a corrupted index, edit it in place and keep the serial ahead of the
-last published value.
-
-## Policies
-
-Channel policy files live under:
-
-```text
-policies/stable.json
-policies/dev.json
-```
-
-Both currently exclude Android-non-runtime direct dependencies `chokidar`,
-`dotenv`, `esbuild`, and optional `redis`. Unsafe package signals are enforced in
-code and cannot be disabled by a policy file.
-
-## Local build
-
-Stable:
+## Local verification
 
 ```bash
 python3 -m unittest discover -s tests -v
 python3 scripts/build_runtime_pack.py \
-  --core-dir /path/to/huangxd-danmu_api \
-  --channel stable \
-  --core-sha <full-stable-sha> \
+  --runtime-dir runtime \
+  --stable-core-dir /path/to/huangxd-danmu_api \
+  --dev-core-dir /path/to/lilixu3-danmu_api \
   --output-dir dist \
-  --policy policies/stable.json \
+  --serial 1 \
   --node-major 18
 ```
 
-Development:
-
-```bash
-python3 scripts/build_runtime_pack.py \
-  --core-dir /path/to/lilixu3-danmu_api \
-  --channel dev \
-  --core-sha <full-dev-sha> \
-  --output-dir dist \
-  --policy policies/dev.json \
-  --node-major 18
-```
-
-## Scheduling
-
-- Stable checks `huangxd-/danmu_api@main` at minute 17 every two hours.
-- Development checks `lilixu3/danmu_api@main` at minute 47 every two hours.
-- Manual `force` dispatch remains available per channel for diagnostics or recovery
-  when that SHA's Release does not yet exist; it never overwrites an existing asset.
-
-Historical immutable packs from these two sources are retained for rollback;
-no third repository is admitted.
+The generated `dist/node_modules.zip` is deterministic for a fixed lockfile.

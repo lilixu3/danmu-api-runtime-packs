@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import hashlib
 import json
 import tempfile
@@ -6,514 +8,208 @@ import zipfile
 from pathlib import Path
 
 from scripts.build_runtime_pack import (
-    EMBEDDED_NODE_MAJOR,
-    INDEX_SCHEMA,
-    MAX_INDEX_ENTRIES,
-    TRUSTED_CHANNELS,
+    MANIFEST_SCHEMA,
+    RUNTIME_PROTOCOL,
     PackBuildError,
-    UPSTREAM_CORE_REPO,
     _zip_deterministic,
     build_manifest,
     canonical_json_bytes,
     collect_package_records,
     dependency_fingerprint,
-    filter_android_dependencies,
-    merge_index_entry,
-    new_channel_index,
-    revoke_index_entry,
-    sha256_file,
     source_dependencies,
-    trusted_channel,
-    validate_channel_source,
+    validate_core_coverage,
+    validate_lockfile,
     validate_package_tree,
+    version_satisfies,
 )
-from scripts.build_legacy_compat_pack import build_legacy_compat_pack
-from scripts.update_legacy_index import update_legacy_index
 
 
-class BuildRuntimePackTest(unittest.TestCase):
-    def test_release_assets_are_immutable(self):
-        workflow = (
-            Path(__file__).resolve().parents[1]
-            / ".github/workflows/_publish-channel-runtime-pack.yml"
-        ).read_text(encoding="utf-8")
-        self.assertNotIn("--clobber", workflow)
-        self.assertEqual(2, workflow.count("cmp --silent"))
-        self.assertIn("已发布的通道依赖包不可覆盖", workflow)
-        self.assertIn("已发布的旧版兼容依赖包不可覆盖", workflow)
-
-    def test_uses_only_the_stable_and_dev_core_repositories(self):
-        self.assertEqual(UPSTREAM_CORE_REPO, "huangxd-/danmu_api")
-        self.assertEqual(
-            TRUSTED_CHANNELS,
-            {
-                "stable": {
-                    "repo": "huangxd-/danmu_api",
-                    "branch": "main",
-                    "url": "https://github.com/huangxd-/danmu_api.git",
-                },
-                "dev": {
-                    "repo": "lilixu3/danmu_api",
-                    "branch": "main",
-                    "url": "https://github.com/lilixu3/danmu_api.git",
-                },
-            },
-        )
-        self.assertEqual("lilixu3/danmu_api", trusted_channel("DEV")["repo"])
-        with self.assertRaises(PackBuildError):
-            trusted_channel("custom")
-        with self.assertRaises(PackBuildError):
-            validate_channel_source("dev", "huangxd-/danmu_api", "main")
-        with self.assertRaises(PackBuildError):
-            validate_channel_source("stable", "huangxd-/danmu_api", "test")
-
-    def test_filters_only_explicit_non_android_dependencies(self):
-        package_json = {
+class RuntimePackBuilderTest(unittest.TestCase):
+    @staticmethod
+    def runtime_package() -> dict:
+        return {
             "dependencies": {
+                "@dan-uni/dan-any": "2.3.9",
+                "brotli": "1.3.3",
+                "https-proxy-agent": "7.0.6",
+                "node-fetch": "3.3.2",
+                "opencc-js": "1.4.1",
+                "pako": "2.1.0",
+            }
+        }
+
+    def test_common_runtime_covers_stable_and_dev(self):
+        stable = {
+            "dependencies": {
+                "chokidar": "^4.0.3",
+                "dotenv": "^16.4.7",
+                "esbuild": "^0.25.10",
+                "https-proxy-agent": "^7.0.6",
+                "node-fetch": "^3.3.2",
+                "pako": "^2.1.0",
+                "redis": "^5.11.0",
+            }
+        }
+        dev = {
+            "dependencies": {
+                **stable["dependencies"],
+                "@dan-uni/dan-any": "^2.3.9",
                 "brotli": "^1.3.3",
+                "opencc-js": "^1.4.1",
+            }
+        }
+        validate_core_coverage(stable, self.runtime_package(), "stable")
+        validate_core_coverage(dev, self.runtime_package(), "dev")
+
+    def test_missing_dev_dependency_is_rejected(self):
+        core = {"dependencies": {"opencc-js": "^1.4.1"}}
+        runtime = self.runtime_package()
+        del runtime["dependencies"]["opencc-js"]
+        with self.assertRaisesRegex(PackBuildError, "opencc-js"):
+            validate_core_coverage(core, runtime, "dev")
+
+    def test_server_build_and_optional_dependencies_are_not_required(self):
+        core = {
+            "dependencies": {
                 "chokidar": "^4.0.3",
                 "dotenv": "^16.4.7",
                 "esbuild": "^0.25.10",
                 "redis": "^5.11.0",
             }
         }
-        policy = {
-            "excludedDirectDependencies": {
-                "chokidar": "server-only",
-                "dotenv": "server-only",
-                "esbuild": "build-only",
-                "redis": "optional",
-            }
-        }
-        self.assertEqual(
-            {"brotli": "^1.3.3"},
-            filter_android_dependencies(package_json, policy),
-        )
+        validate_core_coverage(core, self.runtime_package(), "stable")
 
-    def test_rejects_non_registry_dependency_specs(self):
-        bad_specs = (
-            "git+https://github.com/example/pkg.git",
-            "https://example.com/pkg.tgz",
-            "file:../pkg",
-            "workspace:*",
-            "../local-package",
-        )
-        for spec in bad_specs:
-            with self.subTest(spec=spec), self.assertRaises(PackBuildError):
-                source_dependencies({"dependencies": {"unsafe-package": spec}})
-        self.assertEqual(
-            {"safe-package": "^1.2.3 || ~2.0.0"},
-            source_dependencies({"dependencies": {"safe-package": "^1.2.3 || ~2.0.0"}}),
-        )
+    def test_semver_ranges_used_by_core_are_supported(self):
+        self.assertTrue(version_satisfies("^2.3.9", "2.3.9"))
+        self.assertTrue(version_satisfies("~1.4.1", "1.4.9"))
+        self.assertTrue(version_satisfies(">=1.3.0 <2.0.0", "1.3.3"))
+        self.assertFalse(version_satisfies("^2.3.9", "3.0.0"))
+        self.assertFalse(version_satisfies("^0.2.3", "0.3.0"))
 
-    def test_rejects_libc_limited_packages(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "node_modules" / "platform-package"
-            root.mkdir(parents=True)
-            (root / "package.json").write_text(
-                json.dumps(
-                    {"name": "platform-package", "version": "1.0.0", "libc": ["glibc"]}
-                ),
-                encoding="utf-8",
+    def test_non_registry_dependency_is_rejected(self):
+        with self.assertRaises(PackBuildError):
+            source_dependencies({"dependencies": {"bad": "git+https://example.invalid/repo.git"}})
+
+    def test_lockfile_must_match_runtime_roots_and_have_no_install_scripts(self):
+        dependencies = {"brotli": "1.3.3"}
+        validate_lockfile(
+            {"packages": {"": {"dependencies": dependencies}, "node_modules/brotli": {}}},
+            dependencies,
+        )
+        with self.assertRaisesRegex(PackBuildError, "安装脚本"):
+            validate_lockfile(
+                {
+                    "packages": {
+                        "": {"dependencies": dependencies},
+                        "node_modules/brotli": {"hasInstallScript": True},
+                    }
+                },
+                dependencies,
             )
-            with self.assertRaises(PackBuildError):
-                validate_package_tree(Path(tmp) / "node_modules")
 
-    def test_dependency_fingerprint_is_order_independent(self):
-        left = {"brotli": "^1.3.3", "pako": "^2.1.0"}
-        right = {"pako": "^2.1.0", "brotli": "^1.3.3"}
-        self.assertEqual(dependency_fingerprint(left), dependency_fingerprint(right))
-        self.assertEqual(
-            "546a071745a850d49ec26f4b27dc7591d018e75e3d6cc45ede7d3cb9c604b0ff",
-            dependency_fingerprint(left),
-        )
-        self.assertEqual(
-            64,
-            len(dependency_fingerprint(left)),
-        )
-
-    def test_rejects_lifecycle_install_scripts(self):
+    def test_package_tree_rejects_install_scripts_and_native_files(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "node_modules" / "bad-package"
-            root.mkdir(parents=True)
-            (root / "package.json").write_text(
+            package = Path(tmp) / "node_modules" / "unsafe"
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(
                 json.dumps(
                     {
-                        "name": "bad-package",
+                        "name": "unsafe",
                         "version": "1.0.0",
                         "scripts": {"install": "node install.js"},
                     }
                 ),
                 encoding="utf-8",
             )
-            with self.assertRaises(PackBuildError):
+            with self.assertRaisesRegex(PackBuildError, "安装脚本"):
                 validate_package_tree(Path(tmp) / "node_modules")
 
-    def test_rejects_native_artifacts(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "node_modules" / "native-package"
-            root.mkdir(parents=True)
-            (root / "package.json").write_text(
-                json.dumps({"name": "native-package", "version": "1.0.0"}),
+            (package / "package.json").write_text(
+                json.dumps({"name": "unsafe", "version": "1.0.0"}),
                 encoding="utf-8",
             )
-            (root / "binding.node").write_bytes(b"not-for-android")
-            with self.assertRaises(PackBuildError):
+            (package / "binding.node").write_bytes(b"native")
+            with self.assertRaisesRegex(PackBuildError, "原生"):
                 validate_package_tree(Path(tmp) / "node_modules")
 
     def test_collects_direct_and_transitive_package_records(self):
         lock = {
             "packages": {
-                "": {"dependencies": {"brotli": "^1.3.3"}},
-                "node_modules/brotli": {
-                    "version": "1.3.3",
-                    "resolved": "https://registry.npmjs.org/brotli/-/brotli-1.3.3.tgz",
-                    "integrity": "sha512-brotli",
-                    "dependencies": {"base64-js": "^1.1.2"},
-                },
-                "node_modules/base64-js": {
-                    "version": "1.5.1",
-                    "resolved": "https://registry.npmjs.org/base64-js/-/base64-js-1.5.1.tgz",
-                    "integrity": "sha512-base64",
-                },
+                "": {"dependencies": {"brotli": "1.3.3"}},
+                "node_modules/brotli": {"version": "1.3.3", "integrity": "sha512-brotli"},
+                "node_modules/base64-js": {"version": "1.5.1", "integrity": "sha512-base64"},
             }
         }
         with tempfile.TemporaryDirectory() as tmp:
-            nm = Path(tmp) / "node_modules"
+            node_modules = Path(tmp) / "node_modules"
             for name, version in (("brotli", "1.3.3"), ("base64-js", "1.5.1")):
-                pkg = nm / name
-                pkg.mkdir(parents=True)
-                (pkg / "package.json").write_text(
+                package = node_modules / name
+                package.mkdir(parents=True)
+                (package / "package.json").write_text(
                     json.dumps({"name": name, "version": version}), encoding="utf-8"
                 )
-            records = collect_package_records(nm, lock)
-        self.assertEqual(
-            ["base64-js", "brotli"],
-            [record["name"] for record in records],
-        )
+            records = collect_package_records(node_modules, lock)
+        self.assertEqual(["base64-js", "brotli"], [record["name"] for record in records])
         self.assertEqual("sha512-brotli", records[1]["integrity"])
 
-    def test_merge_index_rejects_cross_channel_entry(self):
-        sha = "a" * 40
-        fingerprint = "b" * 64
-        dev_entry = {
-            "channel": "dev",
-            "coreRepo": "lilixu3/danmu_api",
-            "coreBranch": "main",
-            "coreSha": sha,
-            "dependencyFingerprint": fingerprint,
-        }
-        with self.assertRaises(PackBuildError):
-            merge_index_entry(
-                new_channel_index("stable"),
-                dev_entry,
-                channel="stable",
-            )
-
-    def test_same_fingerprint_stays_separate_between_channels(self):
-        sha = "a" * 40
-        fingerprint = "b" * 64
-        stable_entry = {
-            "channel": "stable",
-            "coreRepo": "huangxd-/danmu_api",
-            "coreBranch": "main",
-            "coreSha": sha,
-            "dependencyFingerprint": fingerprint,
-        }
-        dev_entry = {
-            "channel": "dev",
-            "coreRepo": "lilixu3/danmu_api",
-            "coreBranch": "main",
-            "coreSha": sha,
-            "dependencyFingerprint": fingerprint,
-        }
-        stable = merge_index_entry(
-            new_channel_index("stable"), stable_entry, channel="stable"
-        )
-        dev = merge_index_entry(new_channel_index("dev"), dev_entry, channel="dev")
-        self.assertEqual(stable_entry, stable["entries"][sha])
-        self.assertEqual(dev_entry, dev["entries"][sha])
-        self.assertEqual("stable", stable["channel"])
-        self.assertEqual("dev", dev["channel"])
-
-    def test_merge_index_replaces_existing_entry_only_when_explicitly_forced(self):
-        sha = "a" * 40
-        fingerprint = "b" * 64
-        old = {
-            "channel": "stable",
-            "coreRepo": UPSTREAM_CORE_REPO,
-            "coreBranch": "main",
-            "coreSha": sha,
-            "dependencyFingerprint": fingerprint,
-            "artifactSha256": "1" * 64,
-        }
-        new = {**old, "artifactSha256": "2" * 64}
-        index = merge_index_entry(
-            new_channel_index("stable"), old, channel="stable"
-        )
-        with self.assertRaises(PackBuildError):
-            merge_index_entry(index, new, channel="stable")
-        result = merge_index_entry(index, new, channel="stable", replace=True)
-        self.assertEqual(new, result["entries"][sha])
-        self.assertEqual(sha, result["dependencyEntries"][fingerprint])
-
-    @staticmethod
-    def _stable_entry(index: int) -> dict:
-        return {
-            "channel": "stable",
-            "coreRepo": UPSTREAM_CORE_REPO,
-            "coreBranch": "main",
-            "coreSha": f"{index:040x}",
-            "dependencyFingerprint": f"{index:064x}",
-        }
-
-    def test_index_serial_advances_on_every_publish(self):
-        index = new_channel_index("stable")
-        self.assertEqual(0, index["serial"])
-        first = merge_index_entry(index, self._stable_entry(1), channel="stable")
-        self.assertEqual(1, first["serial"])
-        self.assertEqual(1, first["entrySerials"][f"{1:040x}"])
-        second = merge_index_entry(first, self._stable_entry(2), channel="stable")
-        self.assertEqual(2, second["serial"])
-        # Republishing an unchanged entry must still move the serial forward so
-        # the App never sees the same value carry two different index bodies.
-        replayed = merge_index_entry(
-            second, self._stable_entry(2), channel="stable", replace=True
-        )
-        self.assertEqual(3, replayed["serial"])
-
-    def test_index_keeps_only_the_most_recent_entries(self):
-        index = new_channel_index("stable")
-        for number in range(1, MAX_INDEX_ENTRIES + 4):
-            index = merge_index_entry(index, self._stable_entry(number), channel="stable")
-        self.assertEqual(MAX_INDEX_ENTRIES, len(index["entries"]))
-        self.assertEqual(MAX_INDEX_ENTRIES, len(index["entrySerials"]))
-        self.assertNotIn(f"{1:040x}", index["entries"])
-        self.assertIn(f"{MAX_INDEX_ENTRIES + 3:040x}", index["entries"])
-        # Fingerprint mappings must never outlive the entry they point at.
-        self.assertEqual(
-            set(index["entries"]),
-            set(index["dependencyEntries"].values()),
-        )
-        self.assertNotIn(f"{1:064x}", index["dependencyEntries"])
-
-    def test_revoked_entry_is_removed_and_cannot_be_republished(self):
-        index = merge_index_entry(
-            new_channel_index("stable"), self._stable_entry(1), channel="stable"
-        )
-        index = merge_index_entry(index, self._stable_entry(2), channel="stable")
-        revoked = revoke_index_entry(index, f"{1:040X}", channel="stable")
-        self.assertEqual([f"{1:040x}"], revoked["revoked"])
-        self.assertNotIn(f"{1:040x}", revoked["entries"])
-        self.assertNotIn(f"{1:064x}", revoked["dependencyEntries"])
-        self.assertIn(f"{2:040x}", revoked["entries"])
-        self.assertEqual(index["serial"] + 1, revoked["serial"])
-        with self.assertRaises(PackBuildError):
-            merge_index_entry(revoked, self._stable_entry(1), channel="stable")
-        with self.assertRaises(PackBuildError):
-            revoke_index_entry(revoked, "not-a-sha", channel="stable")
-
-    def test_merge_index_rejects_entry_without_dependency_fingerprint(self):
-        with self.assertRaises(PackBuildError):
-            merge_index_entry(
-                new_channel_index("stable"),
-                {
-                    "channel": "stable",
-                    "coreRepo": UPSTREAM_CORE_REPO,
-                    "coreBranch": "main",
-                    "coreSha": "a" * 40,
-                },
-                channel="stable",
-            )
-
-    def test_ignores_package_internal_subpath_package_json(self):
-        lock = {
-            "packages": {
-                "": {"dependencies": {"web-streams-polyfill": "3.3.3"}},
-                "node_modules/web-streams-polyfill": {
-                    "version": "3.3.3",
-                    "integrity": "sha512-streams",
-                },
-            }
-        }
+    def test_zip_contains_only_one_node_modules_root_and_is_deterministic(self):
         with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp) / "node_modules" / "web-streams-polyfill"
-            internal = root / "es2018"
-            internal.mkdir(parents=True)
-            (root / "package.json").write_text(
-                json.dumps({"name": "web-streams-polyfill", "version": "3.3.3"}),
-                encoding="utf-8",
+            root = Path(tmp)
+            source = root / "source"
+            package = source / "node_modules" / "pure-package"
+            package.mkdir(parents=True)
+            (package / "package.json").write_text(
+                '{"name":"pure-package","version":"1.0.0"}', encoding="utf-8"
             )
-            (internal / "package.json").write_text(
-                json.dumps({"type": "module"}), encoding="utf-8"
-            )
-            records = collect_package_records(Path(tmp) / "node_modules", lock)
-        self.assertEqual(["web-streams-polyfill"], [record["name"] for record in records])
+            first = root / "first.zip"
+            second = root / "second.zip"
+            _zip_deterministic(source, first)
+            _zip_deterministic(source, second)
+            self.assertEqual(first.read_bytes(), second.read_bytes())
+            with zipfile.ZipFile(first) as archive:
+                self.assertEqual(
+                    ["node_modules/pure-package/package.json"], archive.namelist()
+                )
 
-    def test_manifest_contains_hashes_for_runtime_files(self):
+    def test_manifest_is_single_pack_metadata_without_channel_or_file_index(self):
         with tempfile.TemporaryDirectory() as tmp:
-            nm = Path(tmp) / "node_modules" / "pure-package"
-            nm.mkdir(parents=True)
-            payload = b"export const ok = true;\n"
-            (nm / "index.js").write_bytes(payload)
-            (nm / "package.json").write_text(
-                json.dumps({"name": "pure-package", "version": "1.0.0"}),
-                encoding="utf-8",
-            )
+            root = Path(tmp)
+            archive = root / "node_modules.zip"
+            archive.write_bytes(b"zip fixture")
+            lock = root / "package-lock.json"
+            lock.write_bytes(b"lock fixture")
+            dependencies = {"opencc-js": "1.4.1"}
             manifest = build_manifest(
-                channel="stable",
-                core_repo=UPSTREAM_CORE_REPO,
-                core_branch="main",
-                core_sha="a" * 40,
-                core_version="1.19.16",
-                dependency_fingerprint="b" * 64,
-                node_modules_dir=Path(tmp) / "node_modules",
+                serial=7,
+                node_major=18,
+                runtime_lock=lock,
+                dependencies=dependencies,
+                archive=archive,
                 package_records=[
                     {
-                        "name": "pure-package",
-                        "version": "1.0.0",
-                        "integrity": None,
+                        "name": "opencc-js",
+                        "version": "1.4.1",
+                        "integrity": "sha512-opencc",
+                        "path": "node_modules/opencc-js",
                     }
                 ],
             )
-        self.assertEqual(INDEX_SCHEMA, manifest["schema"])
-        self.assertEqual("stable", manifest["channel"])
-        self.assertEqual(UPSTREAM_CORE_REPO, manifest["coreRepo"])
-        self.assertEqual("main", manifest["coreBranch"])
-        self.assertEqual(18, EMBEDDED_NODE_MAJOR)
-        self.assertEqual(EMBEDDED_NODE_MAJOR, manifest["nodeMajor"])
-        paths = {item["path"]: item for item in manifest["files"]}
-        self.assertIn("node_modules/pure-package/index.js", paths)
+        archive_sha = hashlib.sha256(b"zip fixture").hexdigest()
+        self.assertEqual(MANIFEST_SCHEMA, manifest["schema"])
+        self.assertEqual(RUNTIME_PROTOCOL, manifest["runtimeProtocol"])
+        self.assertEqual(7, manifest["serial"])
+        self.assertNotIn("channel", manifest)
+        self.assertNotIn("entries", manifest)
+        self.assertNotIn("files", manifest)
+        self.assertEqual(archive_sha, manifest["artifactSha256"])
+        self.assertTrue(manifest["artifactUrl"].endswith("/node_modules.zip"))
         self.assertEqual(
-            hashlib.sha256(payload).hexdigest(),
-            paths["node_modules/pure-package/index.js"]["sha256"],
+            dependency_fingerprint(dependencies), manifest["dependencyFingerprint"]
         )
         self.assertEqual(
             manifest,
             json.loads(canonical_json_bytes(manifest).decode("utf-8")),
         )
-
-    def test_builds_distinct_schema_one_legacy_pack_with_recomputed_hashes(self):
-        sha = "a" * 40
-        fingerprint = "b" * 64
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            channel_root = root / "channel"
-            package_file = channel_root / "node_modules/pure-package/index.js"
-            package_file.parent.mkdir(parents=True)
-            package_payload = b"export const ready = true;\n"
-            package_file.write_bytes(package_payload)
-            (channel_root / "runtime-lock.json").write_text("{}", encoding="utf-8")
-            manifest = {
-                "schema": 2,
-                "channel": "stable",
-                "coreRepo": UPSTREAM_CORE_REPO,
-                "coreBranch": "main",
-                "coreSha": sha,
-                "coreVersion": "1.0.0",
-                "runtimeProtocol": 1,
-                "nodeMajor": 18,
-                "dependencyFingerprint": fingerprint,
-                "packages": [],
-                "files": [
-                    {
-                        "path": "node_modules/pure-package/index.js",
-                        "size": len(package_payload),
-                        "sha256": hashlib.sha256(package_payload).hexdigest(),
-                    }
-                ],
-            }
-            manifest_bytes = canonical_json_bytes(manifest)
-            (channel_root / "manifest.json").write_bytes(manifest_bytes)
-            channel_archive = root / f"runtime-pack-stable-{sha[:12]}.zip"
-            _zip_deterministic(channel_root, channel_archive)
-            channel_entry = {
-                "channel": "stable",
-                "coreRepo": UPSTREAM_CORE_REPO,
-                "coreBranch": "main",
-                "coreSha": sha,
-                "coreVersion": "1.0.0",
-                "runtimeProtocol": 1,
-                "dependencyFingerprint": fingerprint,
-                "artifactUrl": "https://example.invalid/stable.zip",
-                "artifactSha256": sha256_file(channel_archive),
-                "artifactSize": channel_archive.stat().st_size,
-                "manifestSha256": hashlib.sha256(manifest_bytes).hexdigest(),
-                "packages": [],
-            }
-            entry_path = root / "entry.json"
-            entry_path.write_text(json.dumps(channel_entry), encoding="utf-8")
-            output = root / "dist"
-
-            legacy_entry = build_legacy_compat_pack(
-                channel_entry_path=entry_path,
-                channel_archive_path=channel_archive,
-                output_dir=output,
-            )
-            legacy_archive = output / f"runtime-pack-{sha[:12]}.zip"
-            with zipfile.ZipFile(legacy_archive) as archive:
-                legacy_manifest_bytes = archive.read("manifest.json")
-                legacy_manifest = json.loads(legacy_manifest_bytes)
-            with zipfile.ZipFile(channel_archive) as archive:
-                self.assertEqual(2, json.loads(archive.read("manifest.json"))["schema"])
-
-            self.assertEqual(1, legacy_manifest["schema"])
-            self.assertNotIn("channel", legacy_manifest)
-            self.assertNotIn("coreBranch", legacy_manifest)
-            self.assertNotEqual(channel_entry["artifactSha256"], legacy_entry["artifactSha256"])
-            self.assertEqual(sha256_file(legacy_archive), legacy_entry["artifactSha256"])
-            self.assertEqual(legacy_archive.stat().st_size, legacy_entry["artifactSize"])
-            self.assertEqual(
-                hashlib.sha256(legacy_manifest_bytes).hexdigest(),
-                legacy_entry["manifestSha256"],
-            )
-            self.assertEqual(
-                "https://github.com/lilixu3/danmu-api-runtime-packs/"
-                f"releases/download/core-{sha[:12]}/runtime-pack-{sha[:12]}.zip",
-                legacy_entry["artifactUrl"],
-            )
-            legacy_index = update_legacy_index(
-                root / "index.json", output / "legacy-entry.json"
-            )
-            self.assertEqual(legacy_entry["artifactSha256"], legacy_index["entries"][sha]["artifactSha256"])
-
-    def test_legacy_index_rejects_channel_zip_and_dev_entry(self):
-        sha = "a" * 40
-        fingerprint = "b" * 64
-        with tempfile.TemporaryDirectory() as tmp:
-            root = Path(tmp)
-            stable_entry_path = root / "stable-entry.json"
-            stable_entry_path.write_text(
-                json.dumps(
-                    {
-                        "channel": "stable",
-                        "coreRepo": UPSTREAM_CORE_REPO,
-                        "coreBranch": "main",
-                        "coreSha": sha,
-                        "dependencyFingerprint": fingerprint,
-                        "artifactUrl": "https://example.invalid/stable.zip",
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaises(PackBuildError):
-                update_legacy_index(root / "index.json", stable_entry_path)
-
-            dev_entry_path = root / "dev-entry.json"
-            dev_entry_path.write_text(
-                json.dumps(
-                    {
-                        "channel": "dev",
-                        "coreRepo": "lilixu3/danmu_api",
-                        "coreBranch": "main",
-                        "coreSha": sha,
-                        "dependencyFingerprint": fingerprint,
-                    }
-                ),
-                encoding="utf-8",
-            )
-            with self.assertRaises(PackBuildError):
-                update_legacy_index(root / "index.json", dev_entry_path)
 
 
 if __name__ == "__main__":

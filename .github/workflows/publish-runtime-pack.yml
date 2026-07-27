@@ -1,24 +1,207 @@
-name: Publish stable Android runtime pack
+name: Publish shared Android runtime dependencies
 
 on:
   workflow_dispatch:
     inputs:
       force:
-        description: "Rebuild and replace the pack for the current stable SHA"
+        description: "Rebuild and republish the current locked dependency closure"
         required: false
         default: false
         type: boolean
   schedule:
     - cron: "17 */2 * * *"
+  push:
+    branches:
+      - main
+    paths:
+      - "runtime/**"
+      - "scripts/build_runtime_pack.py"
+      - "tests/**"
+      - ".github/workflows/publish-runtime-pack.yml"
 
 permissions:
   contents: write
 
+concurrency:
+  group: runtime-dependencies-${{ github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    outputs:
+      publish: ${{ steps.state.outputs.publish }}
+      serial: ${{ steps.state.outputs.serial }}
+    steps:
+      - name: Checkout pack repository without write credentials
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 18.20.4
+          check-latest: false
+
+      - name: Run builder tests
+        run: python3 -m unittest discover -s tests -v
+
+      - name: Checkout both trusted core heads
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch main https://github.com/huangxd-/danmu_api.git "$RUNNER_TEMP/stable-core"
+          git clone --depth 1 --branch main https://github.com/lilixu3/danmu_api.git "$RUNNER_TEMP/dev-core"
+
+      - name: Verify shared runtime covers both cores
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 scripts/build_runtime_pack.py \
+            --runtime-dir runtime \
+            --stable-core-dir "$RUNNER_TEMP/stable-core" \
+            --dev-core-dir "$RUNNER_TEMP/dev-core" \
+            --validate-only
+
+      - name: Decide whether the locked closure changed
+        id: state
+        env:
+          FORCE_PUBLISH: ${{ inputs.force || false }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          lock_sha="$(sha256sum runtime/package-lock.json | awk '{print $1}')"
+          previous_serial=0
+          current_lock=""
+          if [[ -f manifest.json ]]; then
+            previous_serial="$(jq -r '.serial // 0' manifest.json)"
+            current_lock="$(jq -r '.runtimeLockSha256 // ""' manifest.json)"
+          fi
+          if [[ "$FORCE_PUBLISH" != "true" && "$current_lock" == "$lock_sha" ]]; then
+            publish=false
+          else
+            publish=true
+          fi
+          {
+            echo "publish=$publish"
+            echo "serial=$((previous_serial + 1))"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Build and smoke-test node_modules.zip
+        if: steps.state.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf dist
+          python3 scripts/build_runtime_pack.py \
+            --runtime-dir runtime \
+            --stable-core-dir "$RUNNER_TEMP/stable-core" \
+            --dev-core-dir "$RUNNER_TEMP/dev-core" \
+            --output-dir dist \
+            --serial "${{ steps.state.outputs.serial }}" \
+            --repository "$GITHUB_REPOSITORY" \
+            --node-major 18
+          test -f dist/node_modules.zip
+          jq -e \
+            '(.schema == 3) and (.runtimeProtocol == 2) and (.nodeMajor == 18) and
+             (.artifactUrl | endswith("/node_modules.zip")) and
+             (.artifactSha256 | test("^[0-9a-f]{64}$")) and
+             (.artifactSize > 0) and (.packages | length > 0)' \
+            dist/manifest.json >/dev/null
+
+      - name: Upload verified output
+        if: steps.state.outputs.publish == 'true'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: shared-runtime-dependencies
+          path: dist/
+          if-no-files-found: error
+          retention-days: 1
+
   publish:
-    uses: ./.github/workflows/_publish-channel-runtime-pack.yml
-    with:
-      channel: stable
-      force: ${{ inputs.force || false }}
-    secrets:
-      RUNTIME_PACK_SIGNING_PRIVATE_KEY: ${{ secrets.RUNTIME_PACK_SIGNING_PRIVATE_KEY }}
+    needs: build
+    if: needs.build.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout selected repository branch
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          fetch-depth: 0
+          ref: ${{ github.ref_name }}
+
+      - name: Download verified build output
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: shared-runtime-dependencies
+          path: dist
+
+      - name: Publish immutable node_modules.zip release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive_sha="$(jq -r '.artifactSha256' dist/manifest.json)"
+          tag="runtime-dependencies-${archive_sha:0:12}"
+          expected_url="https://github.com/$GITHUB_REPOSITORY/releases/download/$tag/node_modules.zip"
+          test "$(jq -r '.artifactUrl' dist/manifest.json)" = "$expected_url"
+          test "$(sha256sum dist/node_modules.zip | awk '{print $1}')" = "$archive_sha"
+          if gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            existing_dir="$(mktemp -d)"
+            trap 'rm -rf "$existing_dir"' EXIT
+            gh release download "$tag" \
+              --repo "$GITHUB_REPOSITORY" \
+              --pattern node_modules.zip \
+              --dir "$existing_dir"
+            cmp --silent dist/node_modules.zip "$existing_dir/node_modules.zip"
+          else
+            gh release create "$tag" dist/node_modules.zip \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "Android runtime dependencies ${archive_sha:0:12}" \
+              --notes "Single locked pure-JavaScript node_modules closure for stable and development cores."
+          fi
+
+      - name: Sign the exact manifest bytes
+        env:
+          RUNTIME_PACK_SIGNING_PRIVATE_KEY: ${{ secrets.RUNTIME_PACK_SIGNING_PRIVATE_KEY }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$RUNTIME_PACK_SIGNING_PRIVATE_KEY"
+          key="$RUNNER_TEMP/runtime-pack-signing-key.pem"
+          signature="$RUNNER_TEMP/manifest.sig.bin"
+          umask 077
+          printf '%s\n' "$RUNTIME_PACK_SIGNING_PRIVATE_KEY" > "$key"
+          openssl dgst -sha256 -sign "$key" -out "$signature" dist/manifest.json
+          base64 -w0 "$signature" > dist/manifest.sig
+          openssl dgst -sha256 -verify runtime-pack-public-key.pem \
+            -signature "$signature" dist/manifest.json
+          rm -f "$key" "$signature"
+
+      - name: Commit signed current manifest
+        env:
+          TARGET_BRANCH: ${{ github.ref_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          cp dist/manifest.json manifest.json
+          cp dist/manifest.sig manifest.sig
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add manifest.json manifest.sig
+          git diff --cached --check
+          if git diff --cached --quiet; then
+            echo "签名清单无变化，无需提交。"
+            exit 0
+          fi
+          short="$(jq -r '.artifactSha256[0:12]' manifest.json)"
+          git commit -m "发布公共运行时依赖 $short"
+          git push origin "HEAD:$TARGET_BRANCH"

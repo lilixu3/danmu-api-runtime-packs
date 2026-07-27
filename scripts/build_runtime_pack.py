@@ -1,13 +1,4 @@
-"""Build signed-input Android runtime dependency packs for the Danmu App.
-
-Only two core sources are trusted:
-
-* ``stable`` -> ``huangxd-/danmu_api@main``
-* ``dev`` -> ``lilixu3/danmu_api@main``
-
-The pack repository is only a derived Android-specific artifact repository; it
-never becomes a core source mirror and never builds arbitrary custom cores.
-"""
+"""Build the single signed Android node_modules runtime pack."""
 
 from __future__ import annotations
 
@@ -23,50 +14,20 @@ from pathlib import Path
 from typing import Any, Iterable
 
 
-UPSTREAM_CORE_REPO = "huangxd-/danmu_api"  # Legacy stable-index compatibility.
-RUNTIME_PROTOCOL = 1
-INDEX_SCHEMA = 2
+PACK_REPO = "lilixu3/danmu-api-runtime-packs"
+MANIFEST_SCHEMA = 3
+RUNTIME_PROTOCOL = 2
 EMBEDDED_NODE_MAJOR = 18
-# Older packs stay downloadable through their immutable Release assets; the
-# index only has to carry the window an installed App may still resolve against.
-MAX_INDEX_ENTRIES = 20
-TRUSTED_CHANNELS: dict[str, dict[str, str]] = {
-    "stable": {
-        "repo": "huangxd-/danmu_api",
-        "branch": "main",
-        "url": "https://github.com/huangxd-/danmu_api.git",
-    },
-    "dev": {
-        "repo": "lilixu3/danmu_api",
-        "branch": "main",
-        "url": "https://github.com/lilixu3/danmu_api.git",
-    },
-}
+TRUSTED_CORE_LABELS = ("stable", "dev")
+EXCLUDED_CORE_DEPENDENCIES = {"chokidar", "dotenv", "esbuild", "redis"}
 _DISALLOWED_INSTALL_SCRIPTS = {"preinstall", "install", "postinstall"}
 _NATIVE_SUFFIXES = {".node", ".so", ".dylib", ".dll"}
 _NATIVE_FILENAMES = {"binding.gyp", "binding.cc", "binding.c", "binding.cpp"}
+_SEMVER = re.compile(r"^v?(\d+)\.(\d+)\.(\d+)(?:-[0-9A-Za-z.-]+)?$")
 
 
 class PackBuildError(RuntimeError):
-    """Raised when a dependency tree is not safe for the pure-JS runtime lane."""
-
-
-def trusted_channel(channel: str) -> dict[str, str]:
-    normalized = channel.strip().lower()
-    source = TRUSTED_CHANNELS.get(normalized)
-    if source is None:
-        raise PackBuildError(f"不受支持的依赖通道：{channel}")
-    return {"channel": normalized, **source}
-
-
-def validate_channel_source(channel: str, core_repo: str, core_branch: str) -> dict[str, str]:
-    source = trusted_channel(channel)
-    if core_repo != source["repo"] or core_branch != source["branch"]:
-        raise PackBuildError(
-            f"依赖通道来源不匹配：{source['channel']} 只允许 "
-            f"{source['repo']}@{source['branch']}"
-        )
-    return source
+    """Raised when the shared pure-JavaScript runtime cannot be published."""
 
 
 def canonical_json_bytes(value: Any) -> bytes:
@@ -104,8 +65,6 @@ def sha256_file(path: Path) -> str:
 
 
 def dependency_fingerprint(dependencies: dict[str, str]) -> str:
-    """Return a stable fingerprint for the source core's direct dependency map."""
-
     return sha256_bytes(canonical_json_bytes(dict(sorted(dependencies.items()))))
 
 
@@ -127,99 +86,145 @@ def _validate_registry_dependency_spec(name: str, spec: str) -> None:
 
 
 def source_dependencies(package_json: dict[str, Any]) -> dict[str, str]:
-    """Merge npm dependency declarations in the same precedence order npm uses."""
-
     merged: dict[str, str] = {}
     for field in ("dependencies", "optionalDependencies"):
         values = package_json.get(field) or {}
         if not isinstance(values, dict):
-            raise PackBuildError(f"核心 package.json 的 {field} 不是对象")
+            raise PackBuildError(f"package.json 的 {field} 不是对象")
         for name, spec in values.items():
-            if isinstance(name, str) and isinstance(spec, str) and name.strip() and spec.strip():
-                normalized_name = name.strip()
-                normalized_spec = spec.strip()
-                _validate_registry_dependency_spec(normalized_name, normalized_spec)
-                merged[normalized_name] = normalized_spec
+            if not isinstance(name, str) or not isinstance(spec, str):
+                continue
+            normalized_name = name.strip()
+            normalized_spec = spec.strip()
+            if not normalized_name or not normalized_spec:
+                continue
+            _validate_registry_dependency_spec(normalized_name, normalized_spec)
+            merged[normalized_name] = normalized_spec
     return dict(sorted(merged.items()))
 
 
-def filter_android_dependencies(
-    package_json: dict[str, Any], policy: dict[str, Any]
-) -> dict[str, str]:
-    """Select the dependency roots that belong in the Android pure-JS pack."""
-
-    all_dependencies = source_dependencies(package_json)
-    excluded = policy.get("excludedDirectDependencies") or {}
-    if not isinstance(excluded, dict):
-        raise PackBuildError("依赖策略 excludedDirectDependencies 必须是对象")
+def android_core_dependencies(package_json: dict[str, Any]) -> dict[str, str]:
     return {
         name: spec
-        for name, spec in all_dependencies.items()
-        if name not in excluded
+        for name, spec in source_dependencies(package_json).items()
+        if name not in EXCLUDED_CORE_DEPENDENCIES
     }
 
 
-def _package_roots(node_modules_dir: Path) -> Iterable[tuple[Path, str]]:
-    """Yield every package root, including nested and scoped packages."""
+def _parse_version(value: str) -> tuple[int, int, int] | None:
+    match = _SEMVER.fullmatch(value.strip())
+    if not match:
+        return None
+    return tuple(int(part) for part in match.groups())
 
+
+def version_satisfies(spec: str, installed: str) -> bool:
+    version = _parse_version(installed)
+    if version is None:
+        return False
+    normalized = spec.strip()
+    if normalized in {"*", "latest"}:
+        return True
+    if "||" in normalized:
+        return any(version_satisfies(part, installed) for part in normalized.split("||"))
+    exact = _parse_version(normalized)
+    if exact is not None:
+        return version == exact
+    if normalized.startswith("^"):
+        minimum = _parse_version(normalized[1:])
+        if minimum is None:
+            return False
+        if minimum[0] > 0:
+            maximum = (minimum[0] + 1, 0, 0)
+        elif minimum[1] > 0:
+            maximum = (0, minimum[1] + 1, 0)
+        else:
+            maximum = (0, 0, minimum[2] + 1)
+        return minimum <= version < maximum
+    if normalized.startswith("~"):
+        minimum = _parse_version(normalized.lstrip("~>="))
+        return minimum is not None and minimum <= version < (minimum[0], minimum[1] + 1, 0)
+    if normalized.startswith(">="):
+        parts = normalized.split()
+        minimum = _parse_version(parts[0][2:])
+        if minimum is None or version < minimum:
+            return False
+        if len(parts) == 1:
+            return True
+        if len(parts) == 2 and parts[1].startswith("<"):
+            maximum = _parse_version(parts[1].lstrip("<="))
+            return maximum is not None and version < maximum
+    return False
+
+
+def validate_core_coverage(
+    core_package_json: dict[str, Any],
+    runtime_package_json: dict[str, Any],
+    label: str,
+) -> None:
+    runtime = source_dependencies(runtime_package_json)
+    required = android_core_dependencies(core_package_json)
+    uncovered: list[str] = []
+    for name, spec in required.items():
+        runtime_spec = runtime.get(name)
+        installed = _parse_version(runtime_spec or "")
+        if runtime_spec is None or installed is None or not version_satisfies(
+            spec, ".".join(str(part) for part in installed)
+        ):
+            uncovered.append(f"{name}@{spec}")
+    if uncovered:
+        raise PackBuildError(
+            f"公共运行时未覆盖{label}核心依赖：{', '.join(sorted(uncovered))}"
+        )
+
+
+def _package_roots(node_modules_dir: Path) -> Iterable[tuple[Path, str]]:
     if not node_modules_dir.is_dir():
         raise PackBuildError(f"缺少 node_modules：{node_modules_dir}")
     for package_json in sorted(node_modules_dir.rglob("package.json")):
-        try:
-            relative = package_json.relative_to(node_modules_dir)
-        except ValueError:
-            continue
+        relative = package_json.relative_to(node_modules_dir)
         parts = relative.parts
         if len(parts) < 2:
             continue
-        # The node_modules directory passed to this function is implicit for
-        # top-level packages; nested packages carry an explicit marker. A
-        # package root has one segment (or two for a scoped package) after the
-        # nearest node_modules marker. This excludes arbitrary package data
-        # files such as package subdirectories containing their own JSON.
         markers = [index for index, part in enumerate(parts[:-1]) if part == "node_modules"]
         start = markers[-1] + 1 if markers else 0
         package_parts = parts[start:-1]
-        if not package_parts:
-            continue
-        if package_parts[0].startswith("@"):
+        if package_parts and package_parts[0].startswith("@"):
             if len(package_parts) != 2:
                 continue
-            package_name = "/".join(package_parts[:2])
-        else:
-            if len(package_parts) != 1:
-                continue
+            package_name = "/".join(package_parts)
+        elif len(package_parts) == 1:
             package_name = package_parts[0]
-        package_root = package_json.parent
-        yield package_root, package_name
+        else:
+            continue
+        yield package_json.parent, package_name
 
 
 def _iter_runtime_files(node_modules_dir: Path) -> Iterable[tuple[Path, str]]:
     for path in sorted(node_modules_dir.rglob("*")):
-        if not path.is_file() or path.is_symlink():
+        relative = path.relative_to(node_modules_dir)
+        if path.is_symlink():
+            if relative.parts and relative.parts[0] == ".bin":
+                continue
+            raise PackBuildError(f"依赖包中禁止符号链接：{path}")
+        if not path.is_file():
             continue
-        relative = path.relative_to(node_modules_dir).as_posix()
-        if relative == ".package-lock.json" or "/.package-lock.json" in relative:
+        relative_path = relative.as_posix()
+        if relative_path == ".package-lock.json" or "/.package-lock.json" in relative_path:
             continue
-        yield path, f"node_modules/{relative}"
+        yield path, f"node_modules/{relative_path}"
 
 
-def validate_package_tree(node_modules_dir: Path) -> list[dict[str, Any]]:
-    """Validate and return package metadata for a pure-JS runtime tree."""
-
-    records: list[dict[str, Any]] = []
-    seen_roots: set[Path] = set()
+def validate_package_tree(node_modules_dir: Path) -> None:
+    package_count = 0
     for package_root, package_name in _package_roots(node_modules_dir):
-        if package_root in seen_roots:
-            continue
-        seen_roots.add(package_root)
-        package_file = package_root / "package.json"
-        package_json = read_json(package_file)
+        package_count += 1
+        package_json = read_json(package_root / "package.json")
         if not isinstance(package_json, dict):
-            raise PackBuildError(f"包清单不是对象：{package_file}")
+            raise PackBuildError(f"包清单不是对象：{package_root}")
         scripts = package_json.get("scripts") or {}
         if not isinstance(scripts, dict):
-            raise PackBuildError(f"包 scripts 不是对象：{package_file}")
+            raise PackBuildError(f"包 scripts 不是对象：{package_root}")
         bad_scripts = sorted(set(scripts).intersection(_DISALLOWED_INSTALL_SCRIPTS))
         if bad_scripts:
             raise PackBuildError(
@@ -227,21 +232,13 @@ def validate_package_tree(node_modules_dir: Path) -> list[dict[str, Any]]:
             )
         if package_json.get("os") or package_json.get("cpu") or package_json.get("libc"):
             raise PackBuildError(f"拒绝带平台限定的包：{package_name}")
-        for file_path, _ in _iter_runtime_files(package_root):
-            if file_path.suffix.lower() in _NATIVE_SUFFIXES or file_path.name in _NATIVE_FILENAMES:
-                raise PackBuildError(f"拒绝包含原生构建文件的包：{package_name}（{file_path.name}）")
-            if "prebuilds" in file_path.parts:
-                raise PackBuildError(f"拒绝包含 prebuilds 的包：{package_name}")
-        records.append(
-            {
-                "name": str(package_json.get("name") or package_name),
-                "version": str(package_json.get("version") or ""),
-                "integrity": None,
-            }
-        )
-    if not records:
+    for file_path, _ in _iter_runtime_files(node_modules_dir):
+        if file_path.suffix.lower() in _NATIVE_SUFFIXES or file_path.name in _NATIVE_FILENAMES:
+            raise PackBuildError(f"拒绝包含原生构建文件：{file_path}")
+        if "prebuilds" in file_path.parts:
+            raise PackBuildError(f"拒绝包含 prebuilds：{file_path}")
+    if package_count == 0:
         raise PackBuildError("依赖树为空")
-    return records
 
 
 def _lock_package_map(lock: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -251,9 +248,17 @@ def _lock_package_map(lock: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {str(key): value for key, value in packages.items() if isinstance(value, dict)}
 
 
-def collect_package_records(node_modules_dir: Path, lock: dict[str, Any]) -> list[dict[str, Any]]:
-    """Collect package versions and SRI values from the generated lockfile."""
+def validate_lockfile(lock: dict[str, Any], dependencies: dict[str, str]) -> None:
+    packages = _lock_package_map(lock)
+    root_dependencies = packages.get("", {}).get("dependencies") or {}
+    if root_dependencies != dependencies:
+        raise PackBuildError("runtime/package-lock.json 与 package.json 依赖不一致")
+    for key, entry in packages.items():
+        if entry.get("hasInstallScript"):
+            raise PackBuildError(f"lockfile 标记了安装脚本：{key}")
 
+
+def collect_package_records(node_modules_dir: Path, lock: dict[str, Any]) -> list[dict[str, Any]]:
     lock_packages = _lock_package_map(lock)
     records: list[dict[str, Any]] = []
     seen: set[Path] = set()
@@ -263,270 +268,59 @@ def collect_package_records(node_modules_dir: Path, lock: dict[str, Any]) -> lis
         seen.add(package_root)
         package_json = read_json(package_root / "package.json")
         relative_root = package_root.relative_to(node_modules_dir).as_posix()
-        lock_key = f"node_modules/{relative_root}"
-        lock_entry = lock_packages.get(lock_key, {})
-        record = {
-            "name": str(package_json.get("name") or package_name),
-            "version": str(package_json.get("version") or ""),
-            "integrity": lock_entry.get("integrity"),
-            "path": f"node_modules/{relative_root}",
-        }
-        if not record["version"]:
+        lock_entry = lock_packages.get(f"node_modules/{relative_root}", {})
+        version = str(package_json.get("version") or "").strip()
+        if not version:
             raise PackBuildError(f"包缺少版本：{package_root}")
-        records.append(record)
+        records.append(
+            {
+                "name": str(package_json.get("name") or package_name),
+                "version": version,
+                "integrity": lock_entry.get("integrity"),
+                "path": f"node_modules/{relative_root}",
+            }
+        )
     return sorted(records, key=lambda item: (item["path"], item["name"]))
 
 
-def validate_lockfile_install_scripts(lock: dict[str, Any]) -> None:
-    for key, entry in _lock_package_map(lock).items():
-        if entry.get("hasInstallScript"):
-            raise PackBuildError(f"lockfile 标记了安装脚本：{key}")
-
-
-def build_file_manifest(node_modules_dir: Path) -> list[dict[str, Any]]:
-    files: list[dict[str, Any]] = []
-    for path, relative in _iter_runtime_files(node_modules_dir):
-        files.append(
-            {
-                "path": relative,
-                "size": path.stat().st_size,
-                "sha256": sha256_file(path),
-            }
-        )
-    return files
-
-
-def build_manifest(
-    *,
-    channel: str,
-    core_repo: str,
-    core_branch: str,
-    core_sha: str,
-    core_version: str,
-    dependency_fingerprint: str,
-    node_modules_dir: Path,
-    package_records: list[dict[str, Any]],
-    runtime_protocol: int = RUNTIME_PROTOCOL,
-    node_major: int = EMBEDDED_NODE_MAJOR,
-) -> dict[str, Any]:
-    source = validate_channel_source(channel, core_repo, core_branch)
-    if not re.fullmatch(r"[0-9a-fA-F]{40}", core_sha):
-        raise PackBuildError(f"核心 SHA 不是完整 40 位 commit：{core_sha}")
-    return {
-        "schema": INDEX_SCHEMA,
-        "channel": source["channel"],
-        "coreRepo": core_repo,
-        "coreBranch": core_branch,
-        "coreSha": core_sha.lower(),
-        "coreVersion": core_version,
-        "runtimeProtocol": runtime_protocol,
-        "nodeMajor": node_major,
-        "dependencyFingerprint": dependency_fingerprint,
-        "packages": package_records,
-        "files": build_file_manifest(node_modules_dir),
-    }
-
-
-def new_channel_index(channel: str) -> dict[str, Any]:
-    source = trusted_channel(channel)
-    return {
-        "schema": INDEX_SCHEMA,
-        "channel": source["channel"],
-        "source": {"repo": source["repo"], "branch": source["branch"]},
-        "serial": 0,
-        "entries": {},
-        "entrySerials": {},
-        "dependencyEntries": {},
-        "revoked": [],
-    }
-
-
-def _normalize_core_sha(core_sha: str, message: str) -> str:
-    normalized = str(core_sha or "").strip().lower()
-    if not re.fullmatch(r"[0-9a-f]{40}", normalized):
-        raise PackBuildError(f"{message}：{core_sha}")
-    return normalized
-
-
-def _rebuild_dependency_entries(
-    entries: dict[str, Any], dependency_entries: dict[str, str]
-) -> dict[str, str]:
-    """Drop fingerprint mappings whose target entry no longer exists."""
-
-    return {
-        fingerprint: core_sha
-        for fingerprint, core_sha in dependency_entries.items()
-        if core_sha in entries
-    }
-
-
-def _trim_index(result: dict[str, Any], keep: int = MAX_INDEX_ENTRIES) -> None:
-    """Bound index growth so every App install keeps paying a small download.
-
-    Entries are ordered by the index serial they were published under, so the
-    most recently published packs survive. Trimmed packs stay reachable through
-    their immutable Release assets; they merely stop being resolvable by
-    fingerprint, which is what an App running a years-old core would need.
-    """
-
-    entries = dict(result.get("entries") or {})
-    if len(entries) <= keep:
-        return
-    serials = dict(result.get("entrySerials") or {})
-    ordered = sorted(entries, key=lambda sha: (int(serials.get(sha, 0)), sha), reverse=True)
-    survivors = set(ordered[:keep])
-    result["entries"] = {sha: entry for sha, entry in sorted(entries.items()) if sha in survivors}
-    result["entrySerials"] = dict(
-        sorted((sha, serial) for sha, serial in serials.items() if sha in survivors)
-    )
-    result["dependencyEntries"] = dict(
-        sorted(
-            _rebuild_dependency_entries(
-                result["entries"], dict(result.get("dependencyEntries") or {})
-            ).items()
-        )
-    )
-
-
-def revoke_index_entry(index: dict[str, Any], core_sha: str, *, channel: str) -> dict[str, Any]:
-    """Withdraw one published pack from the channel index.
-
-    Removing the entry is what actually stops installs; the ``revoked`` list
-    keeps a later build of the same core SHA from silently reintroducing it. The
-    App refuses an index whose serial went backwards, so a proxy cannot replay
-    the pre-revocation index to undo this.
-    """
-
-    source = trusted_channel(channel)
-    normalized = _normalize_core_sha(core_sha, "吊销目标不是完整 40 位 commit SHA")
-    result = dict(index) if isinstance(index, dict) and index else new_channel_index(channel)
-    if result.get("schema") != INDEX_SCHEMA:
-        raise PackBuildError("现有索引协议版本不受支持")
-    if result.get("channel") != source["channel"]:
-        raise PackBuildError("现有索引通道不匹配")
-
-    entries = {sha: entry for sha, entry in (result.get("entries") or {}).items() if sha != normalized}
-    result["entries"] = dict(sorted(entries.items()))
-    result["entrySerials"] = dict(
-        sorted(
-            (sha, serial)
-            for sha, serial in (result.get("entrySerials") or {}).items()
-            if sha in entries
-        )
-    )
-    result["dependencyEntries"] = dict(
-        sorted(
-            _rebuild_dependency_entries(
-                entries, dict(result.get("dependencyEntries") or {})
-            ).items()
-        )
-    )
-    result["revoked"] = sorted(set(result.get("revoked") or []) | {normalized})
-    result["serial"] = int(result.get("serial") or 0) + 1
-    return result
-
-
-def merge_index_entry(
-    index: dict[str, Any],
-    entry: dict[str, Any],
-    *,
-    channel: str,
-    replace: bool = False,
-) -> dict[str, Any]:
-    source = trusted_channel(channel)
-    validate_channel_source(
-        source["channel"],
-        str(entry.get("coreRepo") or ""),
-        str(entry.get("coreBranch") or ""),
-    )
-    if str(entry.get("channel") or "") != source["channel"]:
-        raise PackBuildError("依赖包 entry 通道与目标索引不一致")
-    core_sha = _normalize_core_sha(entry.get("coreSha"), "索引 entry 缺少完整核心 SHA")
-    fingerprint = str(entry.get("dependencyFingerprint") or "").lower()
-    if not re.fullmatch(r"[0-9a-f]{64}", fingerprint):
-        raise PackBuildError(f"索引 entry 缺少有效依赖指纹：{fingerprint}")
-
-    result = dict(index) if isinstance(index, dict) and index else new_channel_index(channel)
-    if result.get("schema") != INDEX_SCHEMA:
-        raise PackBuildError("现有索引协议版本不受支持")
-    if result.get("channel") != source["channel"]:
-        raise PackBuildError("现有索引通道不匹配")
-    expected_source = {"repo": source["repo"], "branch": source["branch"]}
-    if result.get("source") != expected_source:
-        raise PackBuildError("现有索引来源与受信任通道不匹配")
-    if core_sha in set(result.get("revoked") or []):
-        raise PackBuildError(f"该核心 SHA 已被吊销，不能重新收录：{core_sha}")
-
-    entries = dict(result.get("entries") or {})
-    previous = entries.get(core_sha)
-    if previous is not None and previous != entry and not replace:
-        raise PackBuildError(f"同一核心 SHA 已存在不同依赖包：{core_sha}")
-    entries[core_sha] = entry
-    result["entries"] = dict(sorted(entries.items()))
-    dependency_entries = dict(result.get("dependencyEntries") or {})
-    dependency_entries[fingerprint] = core_sha
-    result["dependencyEntries"] = dict(sorted(dependency_entries.items()))
-    # A monotonic serial lets the App reject a replayed older signed index. It
-    # advances on every publish, including a --replace of an unchanged entry, so
-    # it never repeats a value the App has already accepted.
-    serial = int(result.get("serial") or 0) + 1
-    result["serial"] = serial
-    entry_serials = dict(result.get("entrySerials") or {})
-    entry_serials[core_sha] = serial
-    result["entrySerials"] = dict(sorted(entry_serials.items()))
-    result.setdefault("revoked", [])
-    _trim_index(result)
-    return result
-
-
 def _copy_core_for_smoke(core_dir: Path, target: Path) -> Path:
-    target.mkdir(parents=True, exist_ok=True)
     source_subdir = core_dir / "danmu_api"
     if not source_subdir.is_dir():
         raise PackBuildError(f"核心缺少 danmu_api 目录：{source_subdir}")
+    target.mkdir(parents=True, exist_ok=True)
     for source in source_subdir.iterdir():
         destination = target / source.name
         if source.is_dir():
             shutil.copytree(source, destination, symlinks=False)
         else:
             shutil.copy2(source, destination)
-    package_json = core_dir / "package.json"
-    if package_json.is_file():
-        shutil.copy2(package_json, target / "package.json")
-    else:
-        raise PackBuildError("核心根目录缺少 package.json")
+    shutil.copy2(core_dir / "package.json", target / "package.json")
     return target
 
 
-def run_worker_smoke(core_dir: Path, node_modules_dir: Path, timeout_seconds: int = 60) -> None:
-    with tempfile.TemporaryDirectory(prefix="danmu-pack-smoke-") as tmp:
+def run_worker_smoke(core_dir: Path, node_modules_dir: Path, label: str) -> None:
+    with tempfile.TemporaryDirectory(prefix=f"danmu-pack-smoke-{label}-") as tmp:
         smoke_core = _copy_core_for_smoke(core_dir, Path(tmp) / "core")
         shutil.copytree(node_modules_dir, smoke_core / "node_modules", symlinks=False)
         result = subprocess.run(
-            [
-                "node",
-                "--input-type=module",
-                "-e",
-                "import('./worker.js').then(() => process.exit(0))",
-            ],
+            ["node", "--input-type=module", "-e", "import('./worker.js').then(() => process.exit(0))"],
             cwd=smoke_core,
             capture_output=True,
             text=True,
-            timeout=timeout_seconds,
+            timeout=60,
         )
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()[-2000:]
-            raise PackBuildError(f"worker.js smoke 失败：{detail}")
+            raise PackBuildError(f"{label}核心 worker.js smoke 失败：{detail}")
 
 
 def _zip_deterministic(source_root: Path, output: Path) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     files = [path for path in source_root.rglob("*") if path.is_file()]
-    for path in source_root.rglob("*"):
-        if path.is_symlink():
-            raise PackBuildError(f"依赖包中禁止符号链接：{path}")
     with zipfile.ZipFile(output, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for path in sorted(files, key=lambda item: item.relative_to(source_root).as_posix()):
+            if path.is_symlink():
+                raise PackBuildError(f"依赖包中禁止符号链接：{path}")
             relative = path.relative_to(source_root).as_posix()
             info = zipfile.ZipInfo(relative, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -534,163 +328,154 @@ def _zip_deterministic(source_root: Path, output: Path) -> None:
             archive.writestr(info, path.read_bytes())
 
 
-def extract_core_version(core_dir: Path) -> str:
-    candidates = [core_dir / "danmu_api/configs/globals.js", core_dir / "danmu_api/config/globals.js"]
-    pattern = re.compile(r"VERSION\s*:\s*['\"]([^'\"]+)['\"]")
-    for path in candidates:
-        if not path.is_file():
-            continue
-        match = pattern.search(path.read_text(encoding="utf-8", errors="replace"))
-        if match:
-            return match.group(1)
-    return ""
+def build_manifest(
+    *,
+    serial: int,
+    node_major: int,
+    runtime_lock: Path,
+    dependencies: dict[str, str],
+    archive: Path,
+    package_records: list[dict[str, Any]],
+    repository: str = PACK_REPO,
+) -> dict[str, Any]:
+    if serial <= 0:
+        raise PackBuildError("manifest serial 必须大于 0")
+    archive_sha256 = sha256_file(archive)
+    tag = f"runtime-dependencies-{archive_sha256[:12]}"
+    return {
+        "schema": MANIFEST_SCHEMA,
+        "serial": serial,
+        "runtimeProtocol": RUNTIME_PROTOCOL,
+        "nodeMajor": node_major,
+        "runtimeLockSha256": sha256_file(runtime_lock),
+        "dependencyFingerprint": dependency_fingerprint(dependencies),
+        "dependencies": dependencies,
+        "artifactUrl": (
+            f"https://github.com/{repository}/releases/download/{tag}/node_modules.zip"
+        ),
+        "artifactSha256": archive_sha256,
+        "artifactSize": archive.stat().st_size,
+        "packages": package_records,
+    }
+
+
+def validate_runtime_definition(
+    runtime_dir: Path,
+    core_dirs: dict[str, Path],
+) -> tuple[dict[str, Any], dict[str, Any], dict[str, str]]:
+    if set(core_dirs) != set(TRUSTED_CORE_LABELS):
+        raise PackBuildError("必须同时校验 stable 与 dev 核心")
+    runtime_package = read_json(runtime_dir / "package.json")
+    runtime_lock = read_json(runtime_dir / "package-lock.json")
+    if not isinstance(runtime_package, dict) or not isinstance(runtime_lock, dict):
+        raise PackBuildError("runtime package 或 lock 格式无效")
+    dependencies = source_dependencies(runtime_package)
+    if not dependencies:
+        raise PackBuildError("公共运行时依赖为空")
+    for name, spec in dependencies.items():
+        if _parse_version(spec) is None:
+            raise PackBuildError(f"公共运行时必须锁定精确版本：{name}@{spec}")
+    validate_lockfile(runtime_lock, dependencies)
+    for label, core_dir in core_dirs.items():
+        core_package = read_json(core_dir / "package.json")
+        if not isinstance(core_package, dict):
+            raise PackBuildError(f"{label}核心 package.json 格式无效")
+        validate_core_coverage(core_package, runtime_package, label)
+    return runtime_package, runtime_lock, dependencies
 
 
 def build_pack(
     *,
-    core_dir: Path,
-    channel: str,
-    core_repo: str,
-    core_branch: str,
-    core_sha: str,
+    runtime_dir: Path,
+    core_dirs: dict[str, Path],
     output_dir: Path,
-    policy: dict[str, Any],
-    artifact_url_base: str = "",
-    skip_smoke: bool = False,
+    serial: int,
+    repository: str = PACK_REPO,
     node_major: int = EMBEDDED_NODE_MAJOR,
+    skip_smoke: bool = False,
 ) -> dict[str, Any]:
-    source = validate_channel_source(channel, core_repo, core_branch)
-    policy_channel = str(policy.get("channel") or "")
-    policy_source = policy.get("source") or {}
-    if policy_channel and policy_channel != source["channel"]:
-        raise PackBuildError("依赖策略通道与构建通道不一致")
-    if policy_source and policy_source != {"repo": core_repo, "branch": core_branch}:
-        raise PackBuildError("依赖策略来源与构建来源不一致")
-    package_json = read_json(core_dir / "package.json")
-    if not isinstance(package_json, dict):
-        raise PackBuildError("核心根 package.json 不是对象")
-    all_dependencies = source_dependencies(package_json)
-    android_dependencies = filter_android_dependencies(package_json, policy)
-    if not android_dependencies:
-        raise PackBuildError("过滤后没有 Android 运行时依赖")
+    if serial <= 0:
+        raise PackBuildError("manifest serial 必须大于 0")
+    _, runtime_lock, dependencies = validate_runtime_definition(runtime_dir, core_dirs)
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    short_sha = core_sha[:12].lower()
-    archive_name = f"runtime-pack-{source['channel']}-{short_sha}.zip"
-    with tempfile.TemporaryDirectory(prefix="danmu-pack-build-") as tmp:
+    archive_path = output_dir / "node_modules.zip"
+    with tempfile.TemporaryDirectory(prefix="danmu-runtime-pack-") as tmp:
         work = Path(tmp)
-        project = work / "npm-project"
-        project.mkdir()
-        write_canonical_json(
-            project / "package.json",
-            {
-                "name": "danmu-api-android-runtime-pack",
-                "private": True,
-                "type": "module",
-                "dependencies": android_dependencies,
-            },
+        npm_project = work / "runtime"
+        npm_project.mkdir()
+        shutil.copy2(runtime_dir / "package.json", npm_project / "package.json")
+        shutil.copy2(runtime_dir / "package-lock.json", npm_project / "package-lock.json")
+        result = subprocess.run(
+            ["npm", "ci", "--ignore-scripts", "--omit=dev", "--no-audit", "--no-fund"],
+            cwd=npm_project,
+            capture_output=True,
+            text=True,
+            timeout=600,
         )
-        command = [
-            "npm",
-            "install",
-            "--ignore-scripts",
-            "--omit=dev",
-            "--no-audit",
-            "--no-fund",
-            "--package-lock=true",
-        ]
-        result = subprocess.run(command, cwd=project, capture_output=True, text=True, timeout=600)
         if result.returncode != 0:
             detail = (result.stderr or result.stdout).strip()[-4000:]
-            raise PackBuildError(f"npm 解析 Android 依赖失败：{detail}")
-        lock = read_json(project / "package-lock.json")
-        if not isinstance(lock, dict):
-            raise PackBuildError("npm 未生成有效 package-lock.json")
-        validate_lockfile_install_scripts(lock)
-        node_modules = project / "node_modules"
+            raise PackBuildError(f"npm ci 失败：{detail}")
+
+        node_modules = npm_project / "node_modules"
         validate_package_tree(node_modules)
-        records = collect_package_records(node_modules, lock)
+        package_records = collect_package_records(node_modules, runtime_lock)
         if not skip_smoke:
-            run_worker_smoke(core_dir, node_modules)
+            for label, core_dir in core_dirs.items():
+                run_worker_smoke(core_dir, node_modules, label)
 
         pack_root = work / "pack"
-        pack_node_modules = pack_root / "node_modules"
         shutil.copytree(
             node_modules,
-            pack_node_modules,
+            pack_root / "node_modules",
             symlinks=False,
             ignore=shutil.ignore_patterns(".bin", ".package-lock.json"),
         )
-        # Keep the exact resolver output for diagnosis and future verification.
-        shutil.copy2(project / "package-lock.json", pack_root / "runtime-lock.json")
-        manifest = build_manifest(
-            channel=source["channel"],
-            core_repo=core_repo,
-            core_branch=core_branch,
-            core_sha=core_sha,
-            core_version=extract_core_version(core_dir),
-            dependency_fingerprint=dependency_fingerprint(all_dependencies),
-            node_modules_dir=pack_node_modules,
-            package_records=records,
-            node_major=node_major,
-        )
-        write_canonical_json(pack_root / "manifest.json", manifest)
-        archive_path = output_dir / archive_name
         _zip_deterministic(pack_root, archive_path)
 
-    archive_sha = sha256_file(archive_path)
-    # The manifest is inside the archive; derive its hash from the generated
-    # canonical object so the index can authenticate it without a second file.
-    manifest_sha = sha256_bytes(canonical_json_bytes(manifest))
-    base = artifact_url_base.rstrip("/")
-    artifact_url = f"{base}/{archive_name}" if base else archive_name
-    entry = {
-        "channel": source["channel"],
-        "coreRepo": core_repo,
-        "coreBranch": core_branch,
-        "coreSha": core_sha.lower(),
-        "coreVersion": manifest["coreVersion"],
-        "runtimeProtocol": RUNTIME_PROTOCOL,
-        "dependencyFingerprint": manifest["dependencyFingerprint"],
-        "artifactUrl": artifact_url,
-        "artifactSha256": archive_sha,
-        "artifactSize": archive_path.stat().st_size,
-        "manifestSha256": manifest_sha,
-        "packages": manifest["packages"],
-    }
-    write_canonical_json(output_dir / "entry.json", entry)
-    return entry
+    manifest = build_manifest(
+        serial=serial,
+        node_major=node_major,
+        runtime_lock=runtime_dir / "package-lock.json",
+        dependencies=dependencies,
+        archive=archive_path,
+        package_records=package_records,
+        repository=repository,
+    )
+    write_canonical_json(output_dir / "manifest.json", manifest)
+    return manifest
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--core-dir", type=Path, required=True)
-    parser.add_argument("--channel", choices=sorted(TRUSTED_CHANNELS), required=True)
-    parser.add_argument("--core-sha", required=True)
-    parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--policy", type=Path, required=True)
-    parser.add_argument("--artifact-url-base", default="")
+    parser.add_argument("--runtime-dir", type=Path, default=Path("runtime"))
+    parser.add_argument("--stable-core-dir", type=Path, required=True)
+    parser.add_argument("--dev-core-dir", type=Path, required=True)
+    parser.add_argument("--output-dir", type=Path, default=Path("dist"))
+    parser.add_argument("--serial", type=int, default=0)
+    parser.add_argument("--repository", default=PACK_REPO)
     parser.add_argument("--node-major", type=int, default=EMBEDDED_NODE_MAJOR)
     parser.add_argument("--skip-smoke", action="store_true")
+    parser.add_argument("--validate-only", action="store_true")
     args = parser.parse_args()
-    policy = read_json(args.policy)
-    source = trusted_channel(args.channel)
+    core_dirs = {"stable": args.stable_core_dir, "dev": args.dev_core_dir}
     try:
-        entry = build_pack(
-            core_dir=args.core_dir,
-            channel=source["channel"],
-            core_repo=source["repo"],
-            core_branch=source["branch"],
-            core_sha=args.core_sha,
+        if args.validate_only:
+            validate_runtime_definition(args.runtime_dir, core_dirs)
+            print("stable/dev 核心依赖均已被公共运行时覆盖")
+            return 0
+        manifest = build_pack(
+            runtime_dir=args.runtime_dir,
+            core_dirs=core_dirs,
             output_dir=args.output_dir,
-            policy=policy,
-            artifact_url_base=args.artifact_url_base,
-            skip_smoke=args.skip_smoke,
+            serial=args.serial,
+            repository=args.repository,
             node_major=args.node_major,
+            skip_smoke=args.skip_smoke,
         )
     except PackBuildError as exc:
         parser.error(str(exc))
-    print(json.dumps(entry, ensure_ascii=False, indent=2, sort_keys=True))
+    print(json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True))
     return 0
 
 
