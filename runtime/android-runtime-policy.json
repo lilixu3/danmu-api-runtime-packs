@@ -1,0 +1,143 @@
+{
+  "schema": 1,
+  "approvedPackages": {
+    "node_modules/@bufbuild/protobuf": "2.13.0",
+    "node_modules/@dan-uni/dan-any": "2.3.9",
+    "node_modules/@noble/hashes": "2.2.0",
+    "node_modules/@nodable/entities": "3.0.0",
+    "node_modules/agent-base": "7.1.4",
+    "node_modules/anynum": "1.0.1",
+    "node_modules/base64-js": "1.5.1",
+    "node_modules/bignumber.js": "9.3.1",
+    "node_modules/brotli": "1.3.3",
+    "node_modules/data-uri-to-buffer": "4.0.1",
+    "node_modules/debug": "4.4.3",
+    "node_modules/fast-xml-builder": "1.3.0",
+    "node_modules/fast-xml-parser": "5.10.1",
+    "node_modules/fetch-blob": "3.2.0",
+    "node_modules/formdata-polyfill": "4.0.10",
+    "node_modules/https-proxy-agent": "7.0.6",
+    "node_modules/is-unsafe": "2.0.0",
+    "node_modules/json-bigint": "1.0.0",
+    "node_modules/ms": "2.1.3",
+    "node_modules/node-domexception": "1.0.0",
+    "node_modules/node-fetch": "3.3.2",
+    "node_modules/opencc-js": "1.4.1",
+    "node_modules/pako": "2.1.0",
+    "node_modules/path-expression-matcher": "1.6.2",
+    "node_modules/strnum": "2.4.1",
+    "node_modules/web-streams-polyfill": "3.3.3",
+    "node_modules/xml-naming": "0.3.0",
+    "node_modules/zod": "4.4.3"
+  },
+  "excludedPackages": {
+    "node_modules/@electric-sql/pglite": {
+      "version": "0.5.4",
+      "ownerPath": "node_modules/@dan-uni/dan-any",
+      "ownerVersion": "2.3.9",
+      "reason": "Android cores import dan-any core/main/pure and do not use the PGlite implementation"
+    },
+    "node_modules/@electric-sql/pglite-tools": {
+      "version": "0.4.4",
+      "ownerPath": "node_modules/@dan-uni/dan-any",
+      "ownerVersion": "2.3.9",
+      "reason": "Only used by the excluded dan-any PGlite implementation"
+    },
+    "node_modules/drizzle-orm": {
+      "version": "1.0.0-rc.4-de6c356",
+      "ownerPath": "node_modules/@dan-uni/dan-any",
+      "ownerVersion": "2.3.9",
+      "reason": "Only used by the excluded dan-any PGlite implementation"
+    }
+  },
+  "reviewedCoreImports": {
+    "@dan-uni/dan-any": [
+      "@dan-uni/dan-any/adapters",
+      "@dan-uni/dan-any/core/main/pure"
+    ],
+    "opencc-js": [
+      "opencc-js/core",
+      "opencc-js/dict/STCharacters",
+      "opencc-js/to/cn",
+      "opencc-js/to/tw"
+    ]
+  },
+  "retainedPackageFiles": {
+    "node_modules/opencc-js": {
+      "version": "1.4.1",
+      "files": [
+        "LICENSE",
+        "LICENSES/Apache-2.0.txt",
+        "THIRD_PARTY_LICENSES.md",
+        "dist/esm-lib/core.js",
+        "dist/esm-lib/dict/STCharacters.js",
+        "dist/esm-lib/dict/TSCharacters.js",
+        "dist/esm-lib/dict/TSPhrases.js",
+        "dist/esm-lib/dict/TWVariants.js",
+        "dist/esm-lib/dict/TWVariantsPhrases.js",
+        "dist/esm-lib/to/cn.js",
+        "dist/esm-lib/to/tw.js",
+        "package.json"
+      ]
+    }
+  },
+  "removedPackageFiles": {
+    "node_modules/pako": {
+      "version": "2.1.0",
+      "files": [
+        "dist/pako.es5.js",
+        "dist/pako.es5.min.js",
+        "dist/pako.js",
+        "dist/pako.min.js",
+        "dist/pako_deflate.es5.js",
+        "dist/pako_deflate.es5.min.js",
+        "dist/pako_deflate.js",
+        "dist/pako_deflate.min.js",
+        "dist/pako_inflate.es5.js",
+        "dist/pako_inflate.es5.min.js",
+        "dist/pako_inflate.js",
+        "dist/pako_inflate.min.js"
+      ]
+    }
+  },
+  "removedFileSuffixes": [
+    ".d.cts",
+    ".d.mts",
+    ".d.ts",
+    ".map"
+  ],
+  "removedDocumentPrefixes": [
+    "changelog",
+    "history",
+    "readme"
+  ],
+  "requiredFiles": [
+    "@dan-uni/dan-any/dist/adapters.mjs",
+    "@dan-uni/dan-any/dist/core/main/pure.mjs",
+    "@dan-uni/dan-any/package.json",
+    "base64-js/index.js",
+    "base64-js/package.json",
+    "brotli/dec/dictionary-data.js",
+    "brotli/decompress.js",
+    "brotli/package.json",
+    "data-uri-to-buffer/dist/index.js",
+    "node-fetch/src/index.js",
+    "opencc-js/dist/esm-lib/core.js",
+    "opencc-js/dist/esm-lib/dict/STCharacters.js",
+    "opencc-js/dist/esm-lib/dict/TSCharacters.js",
+    "opencc-js/dist/esm-lib/dict/TSPhrases.js",
+    "opencc-js/dist/esm-lib/dict/TWVariants.js",
+    "opencc-js/dist/esm-lib/dict/TWVariantsPhrases.js",
+    "opencc-js/dist/esm-lib/to/cn.js",
+    "opencc-js/dist/esm-lib/to/tw.js",
+    "opencc-js/package.json",
+    "pako/index.js",
+    "zod/package.json"
+  ],
+  "budgets": {
+    "maxArchiveBytes": 4194304,
+    "maxExtractedBytes": 13631488,
+    "maxFileCount": 1100,
+    "maxPackageCount": 28
+  }
+}

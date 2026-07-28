@@ -15,7 +15,7 @@ on:
       - main
     paths:
       - "runtime/**"
-      - "scripts/build_runtime_pack.py"
+      - "scripts/**"
       - "tests/**"
       - ".github/workflows/publish-runtime-pack.yml"
 
@@ -69,7 +69,7 @@ jobs:
             --dev-core-dir "$RUNNER_TEMP/dev-core" \
             --validate-only
 
-      - name: 判断依赖或核心版本是否变化
+      - name: 判断构建定义或核心提交是否变化
         id: state
         env:
           FORCE_PUBLISH: ${{ inputs.force || false }}
@@ -77,22 +77,30 @@ jobs:
         run: |
           set -euo pipefail
           lock_sha="$(sha256sum runtime/package-lock.json | awk '{print $1}')"
-          stable_version="$(python3 -c 'import sys; from pathlib import Path; from scripts.build_runtime_pack import read_core_version; print(read_core_version(Path(sys.argv[1])))' "$RUNNER_TEMP/stable-core")"
-          dev_version="$(python3 -c 'import sys; from pathlib import Path; from scripts.build_runtime_pack import read_core_version; print(read_core_version(Path(sys.argv[1])))' "$RUNNER_TEMP/dev-core")"
+          policy_sha="$(sha256sum runtime/android-runtime-policy.json | awk '{print $1}')"
+          builder_sha="$(python3 -c 'from scripts.build_runtime_pack import build_definition_sha256; print(build_definition_sha256())')"
+          stable_commit="$(git -C "$RUNNER_TEMP/stable-core" rev-parse HEAD)"
+          dev_commit="$(git -C "$RUNNER_TEMP/dev-core" rev-parse HEAD)"
           previous_serial=0
           current_lock=""
-          current_stable_version=""
-          current_dev_version=""
+          current_policy=""
+          current_builder=""
+          current_stable_commit=""
+          current_dev_commit=""
           if [[ -f manifest.json ]]; then
             previous_serial="$(jq -r '.serial // 0' manifest.json)"
             current_lock="$(jq -r '.runtimeLockSha256 // ""' manifest.json)"
-            current_stable_version="$(jq -r '.coreVersions.stable // ""' manifest.json)"
-            current_dev_version="$(jq -r '.coreVersions.dev // ""' manifest.json)"
+            current_policy="$(jq -r '.runtimePolicySha256 // ""' manifest.json)"
+            current_builder="$(jq -r '.buildDefinitionSha256 // ""' manifest.json)"
+            current_stable_commit="$(jq -r '.coreCommits.stable // ""' manifest.json)"
+            current_dev_commit="$(jq -r '.coreCommits.dev // ""' manifest.json)"
           fi
           if [[ "$FORCE_PUBLISH" != "true" &&
                 "$current_lock" == "$lock_sha" &&
-                "$current_stable_version" == "$stable_version" &&
-                "$current_dev_version" == "$dev_version" ]]; then
+                "$current_policy" == "$policy_sha" &&
+                "$current_builder" == "$builder_sha" &&
+                "$current_stable_commit" == "$stable_commit" &&
+                "$current_dev_commit" == "$dev_commit" ]]; then
             publish=false
           else
             publish=true
@@ -117,13 +125,22 @@ jobs:
             --repository "$GITHUB_REPOSITORY" \
             --node-major 18
           test -f dist/node_modules.zip
-          jq -e \
+          jq -e --slurpfile policy runtime/android-runtime-policy.json \
             '(.schema == 3) and (.runtimeProtocol == 2) and (.nodeMajor == 18) and
              (.coreVersions.stable | test("^[0-9]+(\\.[0-9]+)+")) and
              (.coreVersions.dev | test("^[0-9]+(\\.[0-9]+)+")) and
+             (.coreCommits.stable | test("^[0-9a-f]{40}$")) and
+             (.coreCommits.dev | test("^[0-9a-f]{40}$")) and
+             (.runtimePolicySha256 | test("^[0-9a-f]{64}$")) and
+             (.buildDefinitionSha256 | test("^[0-9a-f]{64}$")) and
              (.artifactUrl | endswith("/node_modules.zip")) and
              (.artifactSha256 | test("^[0-9a-f]{64}$")) and
-             (.artifactSize > 0) and (.packages | length > 0)' \
+             (.artifactSize > 0 and .artifactSize <= $policy[0].budgets.maxArchiveBytes) and
+             (.artifactFileCount > 0 and .artifactFileCount <= $policy[0].budgets.maxFileCount) and
+             (.artifactExtractedSize > 0 and .artifactExtractedSize <= $policy[0].budgets.maxExtractedBytes) and
+             (.packages | length == ($policy[0].approvedPackages | length)) and
+             (.excludedPackages | sort ==
+               ([$policy[0].excludedPackages | keys[] | sub("^node_modules/"; "")] | sort))' \
             dist/manifest.json >/dev/null
 
       - name: 上传已校验的构建结果
