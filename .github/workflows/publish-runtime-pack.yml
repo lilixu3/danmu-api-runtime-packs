@@ -254,3 +254,39 @@ jobs:
           fi
           git commit -m "发布运行时依赖 $version_label"
           git push origin "HEAD:$TARGET_BRANCH"
+
+      - name: 清理同版本旧依赖发布
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          current_tag="runtime-dependencies-$(jq -r '.artifactSha256[0:12]' dist/manifest.json)"
+          stable_version="$(jq -r '.coreVersions.stable' dist/manifest.json)"
+          dev_version="$(jq -r '.coreVersions.dev' dist/manifest.json)"
+          if [[ "$stable_version" == "$dev_version" ]]; then
+            release_title="$stable_version"
+          else
+            release_title="稳定版 $stable_version / 开发版 $dev_version"
+          fi
+          gh release list \
+            --repo "$GITHUB_REPOSITORY" \
+            --limit 100 \
+            --json tagName,name,isDraft,isPrerelease |
+            jq -r \
+              --arg current "$current_tag" \
+              --arg title "$release_title" \
+              '.[] |
+               select(.name == $title) |
+               select(.tagName != $current) |
+               select(.tagName | startswith("runtime-dependencies-")) |
+               select(.isDraft == false and .isPrerelease == false) |
+               .tagName' |
+            while IFS= read -r obsolete_tag; do
+              [[ -n "$obsolete_tag" ]]
+              echo "删除同版本旧依赖发布：$obsolete_tag"
+              gh release delete "$obsolete_tag" \
+                --repo "$GITHUB_REPOSITORY" \
+                --cleanup-tag \
+                --yes
+            done
