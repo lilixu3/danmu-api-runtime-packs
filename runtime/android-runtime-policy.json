@@ -50,6 +50,35 @@
       "reason": "Only used by the excluded dan-any PGlite implementation"
     }
   },
+  "excludedCoreDependencies": {
+    "chokidar": {
+      "reason": "Only the standalone Node server watches .env through chokidar; the Android host uses fs.watch",
+      "allowedReferences": [
+        "danmu_api/server.js"
+      ]
+    },
+    "dotenv": {
+      "reason": "Only the standalone Node server and its test load dotenv; the Android host parses config/.env itself",
+      "allowedReferences": [
+        "danmu_api/server.js",
+        "danmu_api/worker.test.js"
+      ]
+    },
+    "esbuild": {
+      "reason": "Only build tooling and the standalone compatibility shim use esbuild; Android imports the ESM worker directly",
+      "allowedReferences": [
+        "build-forward-widget.js",
+        "danmu_api/esm-shim.cjs"
+      ]
+    },
+    "redis": {
+      "reason": "Redis is an Android opt-in dependency installed separately when LOCAL_REDIS_URL is configured",
+      "allowedReferences": [
+        "build-forward-widget.js",
+        "danmu_api/utils/local-redis-util.js"
+      ]
+    }
+  },
   "reviewedCoreImports": {
     "@dan-uni/dan-any": [
       "@dan-uni/dan-any/adapters",

@@ -52,10 +52,11 @@ jobs:
       - name: 运行构建器测试
         run: python3 -m unittest discover -s tests -v
 
-      - name: 检出稳定版和开发版核心
+      - name: 检出 App、稳定版和开发版核心
         shell: bash
         run: |
           set -euo pipefail
+          git clone --depth 1 --branch main https://github.com/lilixu3/danmu-api-android.git "$RUNNER_TEMP/app"
           git clone --depth 1 --branch main https://github.com/huangxd-/danmu_api.git "$RUNNER_TEMP/stable-core"
           git clone --depth 1 --branch main https://github.com/lilixu3/danmu_api.git "$RUNNER_TEMP/dev-core"
 
@@ -67,18 +68,20 @@ jobs:
             --runtime-dir runtime \
             --stable-core-dir "$RUNNER_TEMP/stable-core" \
             --dev-core-dir "$RUNNER_TEMP/dev-core" \
+            --app-dir "$RUNNER_TEMP/app" \
             --validate-only
 
       - name: 判断构建定义或核心提交是否变化
         id: state
         env:
           FORCE_PUBLISH: ${{ inputs.force || false }}
+          APP_SOURCE_DIR: ${{ runner.temp }}/app
         shell: bash
         run: |
           set -euo pipefail
           lock_sha="$(sha256sum runtime/package-lock.json | awk '{print $1}')"
           policy_sha="$(sha256sum runtime/android-runtime-policy.json | awk '{print $1}')"
-          builder_sha="$(python3 -c 'from scripts.build_runtime_pack import build_definition_sha256; print(build_definition_sha256())')"
+          builder_sha="$(python3 -c 'import os; from pathlib import Path; from scripts.build_runtime_pack import build_definition_sha256; print(build_definition_sha256(Path(os.environ["APP_SOURCE_DIR"])))')"
           stable_commit="$(git -C "$RUNNER_TEMP/stable-core" rev-parse HEAD)"
           dev_commit="$(git -C "$RUNNER_TEMP/dev-core" rev-parse HEAD)"
           previous_serial=0
@@ -120,6 +123,7 @@ jobs:
             --runtime-dir runtime \
             --stable-core-dir "$RUNNER_TEMP/stable-core" \
             --dev-core-dir "$RUNNER_TEMP/dev-core" \
+            --app-dir "$RUNNER_TEMP/app" \
             --output-dir dist \
             --serial "${{ steps.state.outputs.serial }}" \
             --repository "$GITHUB_REPOSITORY" \

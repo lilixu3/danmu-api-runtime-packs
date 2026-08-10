@@ -8,19 +8,24 @@ import zipfile
 from pathlib import Path
 
 from scripts.build_runtime_pack import (
+    APP_RUNTIME_ASSET_ROOT,
+    APP_RUNTIME_HOST_FILES,
     MANIFEST_SCHEMA,
     RUNTIME_PROTOCOL,
     PackBuildError,
     _zip_deterministic,
     apply_android_policy,
+    build_definition_sha256,
     build_manifest,
     canonical_json_bytes,
     collect_package_records,
+    collect_core_package_reference_locations,
     collect_core_package_references,
     dependency_fingerprint,
     read_core_version,
     source_dependencies,
     validate_core_coverage,
+    validate_excluded_core_dependency_references,
     validate_lockfile,
     validate_package_tree,
     validate_policy_lock_inventory,
@@ -59,6 +64,7 @@ class RuntimePackBuilderTest(unittest.TestCase):
                     "reason": "test-only optional feature",
                 }
             },
+            "excludedCoreDependencies": {},
             "reviewedCoreImports": {
                 "owner": ["owner/runtime"],
             },
@@ -76,6 +82,7 @@ class RuntimePackBuilderTest(unittest.TestCase):
         }
 
     def test_common_runtime_covers_stable_and_dev(self):
+        excluded = {"chokidar", "dotenv", "esbuild", "redis"}
         stable = {
             "dependencies": {
                 "chokidar": "^4.0.3",
@@ -95,8 +102,8 @@ class RuntimePackBuilderTest(unittest.TestCase):
                 "opencc-js": "^1.4.1",
             }
         }
-        validate_core_coverage(stable, self.runtime_package(), "stable")
-        validate_core_coverage(dev, self.runtime_package(), "dev")
+        validate_core_coverage(stable, self.runtime_package(), "stable", excluded)
+        validate_core_coverage(dev, self.runtime_package(), "dev", excluded)
 
     def test_missing_dev_dependency_is_rejected(self):
         core = {"dependencies": {"opencc-js": "^1.4.1"}}
@@ -114,7 +121,12 @@ class RuntimePackBuilderTest(unittest.TestCase):
                 "redis": "^5.11.0",
             }
         }
-        validate_core_coverage(core, self.runtime_package(), "stable")
+        validate_core_coverage(
+            core,
+            self.runtime_package(),
+            "stable",
+            {"chokidar", "dotenv", "esbuild", "redis"},
+        )
 
     def test_semver_ranges_used_by_core_are_supported(self):
         self.assertTrue(version_satisfies("^2.3.9", "2.3.9"))
@@ -192,6 +204,88 @@ class RuntimePackBuilderTest(unittest.TestCase):
             dev.mkdir()
             with self.assertRaisesRegex(PackBuildError, "人工评估继续精简"):
                 validate_reviewed_core_imports({"stable": stable, "dev": dev}, policy)
+
+    def test_excluded_core_dependencies_are_limited_to_reviewed_paths(self):
+        policy = self.minimal_android_policy()
+        policy["excludedCoreDependencies"] = {
+            "dotenv": {
+                "reason": "standalone server only",
+                "allowedReferences": ["danmu_api/server.js"],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = {}
+            for label in ("stable", "dev"):
+                core = Path(tmp) / label
+                source = core / "danmu_api" / "server.js"
+                source.parent.mkdir(parents=True)
+                source.write_text("import dotenv from 'dotenv';\n", encoding="utf-8")
+                (core / "package.json").write_text(
+                    '{"dependencies":{"dotenv":"^16.4.7"}}',
+                    encoding="utf-8",
+                )
+                roots[label] = core
+
+            self.assertEqual(
+                {"danmu_api/server.js": {"dotenv"}},
+                collect_core_package_reference_locations(roots["dev"], "dotenv"),
+            )
+            self.assertEqual(
+                {"dotenv"},
+                validate_excluded_core_dependency_references(roots, policy),
+            )
+
+            worker = roots["dev"] / "danmu_api" / "worker.js"
+            worker.write_text("await import('dotenv');\n", encoding="utf-8")
+            with self.assertRaisesRegex(PackBuildError, "未经批准.*worker.js"):
+                validate_excluded_core_dependency_references(roots, policy)
+
+    def test_excluded_core_dependency_policy_rejects_stale_paths(self):
+        policy = self.minimal_android_policy()
+        policy["excludedCoreDependencies"] = {
+            "dotenv": {
+                "reason": "standalone server only",
+                "allowedReferences": [
+                    "danmu_api/server.js",
+                    "danmu_api/removed.js",
+                ],
+            }
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            roots = {}
+            for label in ("stable", "dev"):
+                core = Path(tmp) / label
+                source = core / "danmu_api" / "server.js"
+                source.parent.mkdir(parents=True)
+                source.write_text("import dotenv from 'dotenv';\n", encoding="utf-8")
+                (core / "package.json").write_text(
+                    '{"dependencies":{"dotenv":"^16.4.7"}}',
+                    encoding="utf-8",
+                )
+                roots[label] = core
+            with self.assertRaisesRegex(PackBuildError, "允许引用路径已失效"):
+                validate_excluded_core_dependency_references(roots, policy)
+
+    def test_app_runtime_sources_are_bound_to_build_definition(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            app_dir = Path(tmp) / "app-repository"
+            asset_dir = app_dir / APP_RUNTIME_ASSET_ROOT
+            asset_dir.mkdir(parents=True)
+            for relative_path in APP_RUNTIME_HOST_FILES:
+                (asset_dir / relative_path).write_text(
+                    f"fixture:{relative_path}\n",
+                    encoding="utf-8",
+                )
+            original = build_definition_sha256(app_dir)
+            (asset_dir / "android-server.js").write_text(
+                "changed host fixture\n",
+                encoding="utf-8",
+            )
+            self.assertNotEqual(original, build_definition_sha256(app_dir))
+
+            (asset_dir / "worker-proxy.js").unlink()
+            with self.assertRaisesRegex(PackBuildError, "缺少宿主文件"):
+                build_definition_sha256(app_dir)
 
     def test_android_policy_prunes_and_preserves_local_import_closure(self):
         policy = self.minimal_android_policy()
@@ -352,6 +446,7 @@ class RuntimePackBuilderTest(unittest.TestCase):
                 artifact_file_count=12,
                 artifact_extracted_size=1024,
                 excluded_packages=["drizzle-orm"],
+                build_definition_hash="c" * 64,
             )
         archive_sha = hashlib.sha256(b"zip fixture").hexdigest()
         self.assertEqual(MANIFEST_SCHEMA, manifest["schema"])
@@ -366,6 +461,7 @@ class RuntimePackBuilderTest(unittest.TestCase):
             manifest["coreCommits"],
         )
         self.assertEqual(hashlib.sha256(b"policy fixture").hexdigest(), manifest["runtimePolicySha256"])
+        self.assertEqual("c" * 64, manifest["buildDefinitionSha256"])
         self.assertEqual(12, manifest["artifactFileCount"])
         self.assertEqual(1024, manifest["artifactExtractedSize"])
         self.assertEqual(["drizzle-orm"], manifest["excludedPackages"])

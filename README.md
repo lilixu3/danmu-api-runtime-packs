@@ -25,7 +25,7 @@ App 会依次校验清单签名、协议版本、Node.js 主版本、压缩包�
 `runtime/package.json` 是 Android 运行时直接依赖清单，全部使用精确版本；
 `runtime/package-lock.json` 固定完整传递依赖闭包；
 `runtime/android-runtime-policy.json` 则固定经过人工确认的 Android 包集合、
-版本绑定裁剪规则、关键文件和体积预算。当前直接依赖如下：
+版本绑定裁剪规则、核心依赖豁免路径、关键文件和体积预算。当前直接依赖如下：
 
 - `@dan-uni/dan-any`
 - `brotli`
@@ -34,13 +34,16 @@ App 会依次校验清单签名、协议版本、Node.js 主版本、压缩包�
 - `opencc-js`
 - `pako`
 
-发布工作流会同时检查以下两个核心的 `main` 分支：
+发布工作流会同时检查 App 和以下两个核心的 `main` 分支：
 
+- Android 宿主：`lilixu3/danmu-api-android`
 - 稳定版：`huangxd-/danmu_api`
 - 开发版：`lilixu3/danmu_api`
 
 任一核心新增未覆盖的运行时依赖都会使发布失败。仅用于服务端监听、构建或可选
-缓存的 `chokidar`、`dotenv`、`esbuild` 和 `redis` 不进入 Android 依赖包。
+缓存的 `chokidar`、`dotenv`、`esbuild` 和 `redis` 不进入 Android 依赖包；这些
+豁免同时绑定允许引用它们的具体源码路径，引用移入 `worker.js` 等 Android 可达路径、
+依赖声明消失或白名单路径失效时，构建都会要求人工复核。
 
 ## Android 精简策略
 
@@ -54,9 +57,9 @@ App 会依次校验清单签名、协议版本、Node.js 主版本、压缩包�
 - `opencc-js` 只保留核心实际导入的简繁转换模块、字典和许可证；
 - 删除 source map、类型声明、说明文档和 Pako 重复发行文件。
 
-排除项、文件白名单和被裁剪包的核心导入入口都经过审核。包新增、删除、升级，核心改用
-未经确认的 Dan-any/OpenCC 入口，或者产物超出包数量、文件数量、解压体积、ZIP 体积
-预算时，构建会以差异信息失败，必须人工更新策略后才能发布。
+排除项、核心依赖豁免路径、文件白名单和被裁剪包的核心导入入口都经过审核。包新增、
+删除、升级，核心改用未经确认的 Dan-any/OpenCC 入口，或者产物超出包数量、文件数量、
+解压体积、ZIP 体积预算时，构建会以差异信息失败，必须人工更新策略后才能发布。
 生成的 `build-report.json` 会列出完整依赖与 Android 精简结果的包数、文件数和体积。
 
 ## 安全校验
@@ -69,13 +72,17 @@ App 会依次校验清单签名、协议版本、Node.js 主版本、压缩包�
 - `prebuilds`、符号链接和非 npm registry 依赖。
 
 裁剪完成后，构建器会先执行 Dan-any pure/adapters、OpenCC、Brotli、Pako、
-node-fetch 和代理模块的功能 smoke，再分别启动稳定版与开发版真实核心的
-`worker.js`。私钥只提供给独立的签名发布任务，构建任务没有仓库写权限和签名私钥。
+node-fetch 和代理模块的功能 smoke，再分别导入稳定版与开发版真实核心的
+`worker.js`。随后使用 App 当前真实的 `main.js`、`android-server.js` 和
+`worker-proxy.js` 组装临时运行目录，为两个核心各启动一次完整宿主，校验 worker
+线程未回退、`/__health` 内容正确且 `/__shutdown` 能正常退出。私钥只提供给独立的
+签名发布任务，构建任务没有仓库写权限和签名私钥。
 
-工作流每两小时读取两个核心的最新提交 SHA。任一 SHA、锁文件、精简策略或构建器
-发生变化都会重新生成精简候选并执行全部测试；只有 ZIP 内容哈希变化时才会创建新的
-依赖 Release，内容未变化时只更新签名兼容性清单。新包和清单提交成功后，会删除标题
-相同的旧哈希 Release，因此每组核心版本在仓库中只保留当前有效的一份依赖包。
+工作流每两小时读取两个核心的最新提交 SHA，并把 App Android 宿主文件的内容纳入
+`buildDefinitionSha256`。任一核心 SHA、宿主文件、锁文件、精简策略或构建器发生变化
+都会重新生成精简候选并执行全部测试；只有 ZIP 内容哈希变化时才会创建新的依赖
+Release，内容未变化时只更新签名兼容性清单。新包和清单提交成功后，会删除标题相同的
+旧哈希 Release，因此每组核心版本在仓库中只保留当前有效的一份依赖包。
 
 ## 本地校验
 
@@ -85,6 +92,7 @@ python3 scripts/build_runtime_pack.py \
   --runtime-dir runtime \
   --stable-core-dir /path/to/huangxd-danmu_api \
   --dev-core-dir /path/to/lilixu3-danmu_api \
+  --app-dir /path/to/danmu-api-android \
   --output-dir dist \
   --serial 1 \
   --node-major 18

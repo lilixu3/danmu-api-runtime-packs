@@ -5,10 +5,15 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 import re
 import shutil
+import socket
 import subprocess
 import tempfile
+import time
+import urllib.error
+import urllib.request
 import zipfile
 from pathlib import Path
 from typing import Any, Iterable
@@ -21,7 +26,6 @@ EMBEDDED_NODE_MAJOR = 18
 EMBEDDED_NODE_VERSION = "18.20.4"
 TRUSTED_CORE_LABELS = ("stable", "dev")
 ANDROID_POLICY_FILE = "android-runtime-policy.json"
-EXCLUDED_CORE_DEPENDENCIES = {"chokidar", "dotenv", "esbuild", "redis"}
 _DISALLOWED_INSTALL_SCRIPTS = {"preinstall", "install", "postinstall"}
 _NATIVE_SUFFIXES = {".node", ".so", ".dylib", ".dll"}
 _NATIVE_FILENAMES = {"binding.gyp", "binding.cc", "binding.c", "binding.cpp"}
@@ -30,6 +34,16 @@ _CORE_VERSION = re.compile(r"^v?\d+(?:\.\d+){1,3}(?:[-+][0-9A-Za-z.-]+)?$")
 _GLOBALS_VERSION = re.compile(r"\bVERSION\s*:\s*(['\"])([^'\"]+)\1")
 _COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
 _CORE_SOURCE_SUFFIXES = {".js", ".mjs", ".cjs", ".ts", ".mts", ".cts"}
+APP_RUNTIME_ASSET_ROOT = Path("app/src/main/assets/nodejs-project")
+APP_RUNTIME_HOST_FILES = (
+    "main.js",
+    "android-server.js",
+    "worker-proxy.js",
+    "runtime-polyfills.js",
+    "startup-failure.js",
+    "favorite-scheduler-host.js",
+    "package.json",
+)
 
 
 class PackBuildError(RuntimeError):
@@ -74,7 +88,22 @@ def dependency_fingerprint(dependencies: dict[str, str]) -> str:
     return sha256_bytes(canonical_json_bytes(dict(sorted(dependencies.items()))))
 
 
-def build_definition_sha256() -> str:
+def _app_runtime_asset_dir(app_dir: Path) -> Path:
+    return app_dir / APP_RUNTIME_ASSET_ROOT
+
+
+def _validated_app_runtime_files(app_dir: Path) -> list[tuple[str, Path]]:
+    asset_dir = _app_runtime_asset_dir(app_dir)
+    files: list[tuple[str, Path]] = []
+    for relative_path in APP_RUNTIME_HOST_FILES:
+        source = asset_dir / relative_path
+        if not source.is_file():
+            raise PackBuildError(f"App Android 运行时缺少宿主文件：{source}")
+        files.append((relative_path, source))
+    return files
+
+
+def build_definition_sha256(app_dir: Path | None = None) -> str:
     digest = hashlib.sha256()
     script_paths = (Path(__file__), Path(__file__).with_name("android_runtime_smoke.mjs"))
     for path in script_paths:
@@ -82,6 +111,12 @@ def build_definition_sha256() -> str:
         digest.update(b"\0")
         digest.update(path.read_bytes())
         digest.update(b"\0")
+    if app_dir is not None:
+        for relative_path, path in _validated_app_runtime_files(app_dir):
+            digest.update(f"app-runtime/{relative_path}".encode("utf-8"))
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
     return digest.hexdigest()
 
 
@@ -120,6 +155,7 @@ def load_android_policy(path: Path) -> dict[str, Any]:
     required_maps = (
         "approvedPackages",
         "excludedPackages",
+        "excludedCoreDependencies",
         "reviewedCoreImports",
         "retainedPackageFiles",
         "removedPackageFiles",
@@ -135,11 +171,14 @@ def load_android_policy(path: Path) -> dict[str, Any]:
     return policy
 
 
-def collect_core_package_references(core_dir: Path, package_name: str) -> set[str]:
+def collect_core_package_reference_locations(
+    core_dir: Path,
+    package_name: str,
+) -> dict[str, set[str]]:
     quoted_reference = re.compile(
         rf"(?P<quote>['\"`])(?P<specifier>{re.escape(package_name)}(?:/[^'\"`\s]*)?)(?P=quote)"
     )
-    references: set[str] = set()
+    references: dict[str, set[str]] = {}
     for source in sorted(core_dir.rglob("*")):
         if (
             not source.is_file()
@@ -152,8 +191,93 @@ def collect_core_package_references(core_dir: Path, package_name: str) -> set[st
             content = source.read_text(encoding="utf-8")
         except OSError as exc:
             raise PackBuildError(f"无法读取核心源码：{source}") from exc
-        references.update(match.group("specifier") for match in quoted_reference.finditer(content))
+        specifiers = {
+            match.group("specifier") for match in quoted_reference.finditer(content)
+        }
+        if specifiers:
+            references[source.relative_to(core_dir).as_posix()] = specifiers
     return references
+
+
+def collect_core_package_references(core_dir: Path, package_name: str) -> set[str]:
+    locations = collect_core_package_reference_locations(core_dir, package_name)
+    return {specifier for specifiers in locations.values() for specifier in specifiers}
+
+
+def _validate_relative_source_path(value: str, package_name: str) -> None:
+    path = Path(value)
+    if (
+        not value
+        or "\\" in value
+        or path.is_absolute()
+        or any(part in {"", ".", ".."} for part in path.parts)
+        or path.suffix.lower() not in _CORE_SOURCE_SUFFIXES
+    ):
+        raise PackBuildError(f"{package_name} 包含无效的允许引用路径：{value}")
+
+
+def validate_excluded_core_dependency_references(
+    core_dirs: dict[str, Path],
+    policy: dict[str, Any],
+) -> set[str]:
+    rules = policy["excludedCoreDependencies"]
+    declared_by_label: dict[str, dict[str, str]] = {}
+    for label, core_dir in core_dirs.items():
+        package_json = read_json(core_dir / "package.json")
+        if not isinstance(package_json, dict):
+            raise PackBuildError(f"{label}核心 package.json 格式无效")
+        declared_by_label[label] = source_dependencies(package_json)
+
+    declared_names = {
+        name for dependencies in declared_by_label.values() for name in dependencies
+    }
+    excluded_names: set[str] = set()
+    for package_name, rule in rules.items():
+        if not isinstance(package_name, str) or not package_name.strip():
+            raise PackBuildError("excludedCoreDependencies 包含无效包名")
+        if not isinstance(rule, dict):
+            raise PackBuildError(f"{package_name} 的核心依赖豁免策略不是对象")
+        reason = rule.get("reason")
+        allowed_references = rule.get("allowedReferences")
+        if not isinstance(reason, str) or not reason.strip():
+            raise PackBuildError(f"{package_name} 的核心依赖豁免缺少理由")
+        if (
+            not isinstance(allowed_references, list)
+            or not allowed_references
+            or not all(isinstance(path, str) for path in allowed_references)
+            or len(set(allowed_references)) != len(allowed_references)
+        ):
+            raise PackBuildError(f"{package_name} 的允许引用路径格式无效")
+        for path in allowed_references:
+            _validate_relative_source_path(path, package_name)
+        if package_name not in declared_names:
+            raise PackBuildError(f"核心已不再声明被豁免依赖：{package_name}")
+
+        allowed_paths = set(allowed_references)
+        observed_paths: set[str] = set()
+        for label, core_dir in core_dirs.items():
+            locations = collect_core_package_reference_locations(core_dir, package_name)
+            if locations and package_name not in declared_by_label[label]:
+                raise PackBuildError(f"{label}核心引用了未声明依赖：{package_name}")
+            unexpected = sorted(set(locations).difference(allowed_paths))
+            if unexpected:
+                details = ", ".join(
+                    f"{path} ({', '.join(sorted(locations[path]))})" for path in unexpected
+                )
+                raise PackBuildError(
+                    f"{label}核心在未经批准的 Android 路径引用了被豁免依赖 "
+                    f"{package_name}：{details}"
+                )
+            observed_paths.update(locations)
+
+        stale_paths = sorted(allowed_paths.difference(observed_paths))
+        if stale_paths:
+            raise PackBuildError(
+                f"{package_name} 的允许引用路径已失效，请人工评估："
+                f"{', '.join(stale_paths)}"
+            )
+        excluded_names.add(package_name)
+    return excluded_names
 
 
 def validate_reviewed_core_imports(
@@ -270,11 +394,14 @@ def source_dependencies(package_json: dict[str, Any]) -> dict[str, str]:
     return dict(sorted(merged.items()))
 
 
-def android_core_dependencies(package_json: dict[str, Any]) -> dict[str, str]:
+def android_core_dependencies(
+    package_json: dict[str, Any],
+    excluded_dependencies: set[str] | frozenset[str] = frozenset(),
+) -> dict[str, str]:
     return {
         name: spec
         for name, spec in source_dependencies(package_json).items()
-        if name not in EXCLUDED_CORE_DEPENDENCIES
+        if name not in excluded_dependencies
     }
 
 
@@ -332,9 +459,10 @@ def validate_core_coverage(
     core_package_json: dict[str, Any],
     runtime_package_json: dict[str, Any],
     label: str,
+    excluded_dependencies: set[str] | frozenset[str] = frozenset(),
 ) -> None:
     runtime = source_dependencies(runtime_package_json)
-    required = android_core_dependencies(core_package_json)
+    required = android_core_dependencies(core_package_json, excluded_dependencies)
     uncovered: list[str] = []
     for name, spec in required.items():
         runtime_spec = runtime.get(name)
@@ -835,6 +963,174 @@ def _copy_core_for_smoke(core_dir: Path, target: Path) -> Path:
     return target
 
 
+def _copy_app_runtime_for_smoke(app_dir: Path, target: Path) -> Path:
+    target.mkdir(parents=True, exist_ok=True)
+    for relative_path, source in _validated_app_runtime_files(app_dir):
+        destination = target / relative_path
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination)
+    return target
+
+
+def _reserve_loopback_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as server:
+        server.bind(("127.0.0.1", 0))
+        return int(server.getsockname()[1])
+
+
+def _process_output_tail(output: str | None, limit: int = 4000) -> str:
+    text = (output or "").strip()
+    return text[-limit:] if text else "无输出"
+
+
+def _terminate_smoke_process(process: subprocess.Popen[str]) -> str:
+    if process.poll() is None:
+        process.terminate()
+    try:
+        output, _ = process.communicate(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        output, _ = process.communicate(timeout=5)
+    return output or ""
+
+
+def run_app_host_smoke(
+    app_dir: Path,
+    core_dir: Path,
+    node_modules_dir: Path,
+    label: str,
+    node_executable: str = "node",
+) -> None:
+    if label not in TRUSTED_CORE_LABELS:
+        raise PackBuildError(f"未知 App 宿主 smoke 核心：{label}")
+
+    with tempfile.TemporaryDirectory(prefix=f"danmu-app-host-smoke-{label}-") as tmp:
+        project = _copy_app_runtime_for_smoke(app_dir, Path(tmp) / "project")
+        _copy_core_for_smoke(core_dir, project / f"danmu_api_{label}")
+        smoke_node_modules = project / "node_modules"
+        try:
+            smoke_node_modules.symlink_to(node_modules_dir.resolve(), target_is_directory=True)
+        except OSError:
+            shutil.copytree(node_modules_dir, smoke_node_modules, symlinks=False)
+
+        port = _reserve_loopback_port()
+        runtime_identity = f"runtime-pack-smoke-{label}"
+        env = os.environ.copy()
+        env.update(
+            {
+                "DANMU_API_HOME": str(project),
+                "DANMU_API_HOST": "127.0.0.1",
+                "DANMU_API_PORT": str(port),
+                "DANMU_API_VARIANT": label,
+                "DANMU_API_RUNTIME_IDENTITY": runtime_identity,
+                "DANMU_API_WORKER": "1",
+                "DANMU_API_HOT_RELOAD": "0",
+                "DANMU_API_LOG_TO_FILE": "0",
+            }
+        )
+        env.pop("PROXY_URL", None)
+        env.pop("LOCAL_REDIS_URL", None)
+
+        process = subprocess.Popen(
+            [node_executable, "main.js"],
+            cwd=project,
+            env=env,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+        health_url = f"http://127.0.0.1:{port}/__health"
+        shutdown_url = f"http://127.0.0.1:{port}/__shutdown"
+        health: dict[str, Any] | None = None
+        last_error = "服务尚未监听"
+        output = ""
+        try:
+            deadline = time.monotonic() + 20
+            while time.monotonic() < deadline:
+                if process.poll() is not None:
+                    output, _ = process.communicate(timeout=2)
+                    raise PackBuildError(
+                        f"{label} App 宿主在 /__health 就绪前退出："
+                        f"{_process_output_tail(output)}"
+                    )
+                try:
+                    with opener.open(health_url, timeout=1) as response:
+                        body = response.read().decode("utf-8")
+                        if response.status != 200:
+                            last_error = f"HTTP {response.status}"
+                        else:
+                            value = json.loads(body)
+                            if isinstance(value, dict):
+                                health = value
+                                break
+                            last_error = "健康响应不是 JSON 对象"
+                except (OSError, ValueError, urllib.error.URLError) as exc:
+                    last_error = str(exc)
+                time.sleep(0.1)
+
+            if health is None:
+                raise PackBuildError(
+                    f"{label} App 宿主 /__health 超时：{last_error}"
+                )
+            expected_health = {
+                "ok": True,
+                "variant": label,
+                "runtimeIdentity": runtime_identity,
+                "envHome": str(project),
+                "resolvedHome": str(project),
+                "cacheProbeWritable": True,
+            }
+            mismatches = {
+                key: {"expected": expected, "actual": health.get(key)}
+                for key, expected in expected_health.items()
+                if health.get(key) != expected
+            }
+            if mismatches:
+                raise PackBuildError(
+                    f"{label} App 宿主 /__health 内容不符合预期："
+                    f"{json.dumps(mismatches, ensure_ascii=False, sort_keys=True)}"
+                )
+
+            try:
+                with opener.open(shutdown_url, timeout=2) as response:
+                    shutdown_body = response.read().decode("utf-8").strip()
+                    if response.status != 200 or shutdown_body != "OK":
+                        raise PackBuildError(
+                            f"{label} App 宿主 /__shutdown 失败："
+                            f"HTTP {response.status} {shutdown_body}"
+                        )
+            except PackBuildError:
+                raise
+            except (OSError, urllib.error.URLError) as exc:
+                raise PackBuildError(
+                    f"{label} App 宿主 /__shutdown 请求失败：{exc}"
+                ) from exc
+            try:
+                output, _ = process.communicate(timeout=12)
+            except subprocess.TimeoutExpired as exc:
+                raise PackBuildError(f"{label} App 宿主无法正常退出") from exc
+            if process.returncode != 0:
+                raise PackBuildError(
+                    f"{label} App 宿主退出码为 {process.returncode}："
+                    f"{_process_output_tail(output)}"
+                )
+            if f"Using variant: {label}" not in output:
+                raise PackBuildError(
+                    f"{label} App 宿主未确认选中核心：{_process_output_tail(output)}"
+                )
+            if "Worker init failed, fallback to direct import" in output:
+                raise PackBuildError(
+                    f"{label} App 宿主未通过 worker 线程加载核心："
+                    f"{_process_output_tail(output)}"
+                )
+        finally:
+            if process.poll() is None:
+                _terminate_smoke_process(process)
+
+
 def run_worker_smoke(
     core_dir: Path,
     node_modules_dir: Path,
@@ -916,6 +1212,7 @@ def build_manifest(
     artifact_file_count: int,
     artifact_extracted_size: int,
     excluded_packages: list[str],
+    build_definition_hash: str | None = None,
     repository: str = PACK_REPO,
 ) -> dict[str, Any]:
     if serial <= 0:
@@ -929,7 +1226,7 @@ def build_manifest(
         "nodeMajor": node_major,
         "runtimeLockSha256": sha256_file(runtime_lock),
         "runtimePolicySha256": sha256_file(runtime_policy),
-        "buildDefinitionSha256": build_definition_sha256(),
+        "buildDefinitionSha256": build_definition_hash or build_definition_sha256(),
         "dependencyFingerprint": dependency_fingerprint(dependencies),
         "dependencies": dependencies,
         "coreVersions": core_versions,
@@ -965,13 +1262,22 @@ def validate_runtime_definition(
             raise PackBuildError(f"公共运行时必须锁定精确版本：{name}@{spec}")
     validate_lockfile(runtime_lock, dependencies)
     validate_policy_lock_inventory(runtime_lock, runtime_policy)
+    excluded_dependencies = validate_excluded_core_dependency_references(
+        core_dirs,
+        runtime_policy,
+    )
     validate_reviewed_core_imports(core_dirs, runtime_policy)
     core_versions: dict[str, str] = {}
     for label, core_dir in core_dirs.items():
         core_package = read_json(core_dir / "package.json")
         if not isinstance(core_package, dict):
             raise PackBuildError(f"{label}核心 package.json 格式无效")
-        validate_core_coverage(core_package, runtime_package, label)
+        validate_core_coverage(
+            core_package,
+            runtime_package,
+            label,
+            excluded_dependencies,
+        )
         core_versions[label] = read_core_version(core_dir)
     return runtime_package, runtime_lock, dependencies, core_versions
 
@@ -980,6 +1286,7 @@ def build_pack(
     *,
     runtime_dir: Path,
     core_dirs: dict[str, Path],
+    app_dir: Path,
     output_dir: Path,
     serial: int,
     repository: str = PACK_REPO,
@@ -993,6 +1300,7 @@ def build_pack(
         raise PackBuildError(f"只支持 Node 主版本 {EMBEDDED_NODE_MAJOR}")
     if not skip_smoke:
         validate_node_executable(node_executable)
+    build_definition_hash = build_definition_sha256(app_dir)
     _, runtime_lock, dependencies, core_versions = validate_runtime_definition(
         runtime_dir,
         core_dirs,
@@ -1043,6 +1351,13 @@ def build_pack(
             run_android_runtime_smoke(android_node_modules, node_executable)
             for label, core_dir in core_dirs.items():
                 run_worker_smoke(core_dir, android_node_modules, label, node_executable)
+                run_app_host_smoke(
+                    app_dir,
+                    core_dir,
+                    android_node_modules,
+                    label,
+                    node_executable,
+                )
 
         _zip_deterministic(pack_root, archive_path)
 
@@ -1056,7 +1371,7 @@ def build_pack(
     build_report = {
         "schema": 1,
         "runtimePolicySha256": sha256_file(runtime_policy_path),
-        "buildDefinitionSha256": build_definition_sha256(),
+        "buildDefinitionSha256": build_definition_hash,
         "coreVersions": core_versions,
         "coreCommits": core_commits,
         "full": policy_report["full"],
@@ -1081,6 +1396,7 @@ def build_pack(
         artifact_file_count=android_stats["fileCount"],
         artifact_extracted_size=android_stats["extractedBytes"],
         excluded_packages=policy_report["excludedPackages"],
+        build_definition_hash=build_definition_hash,
         repository=repository,
     )
     write_canonical_json(output_dir / "manifest.json", manifest)
@@ -1092,6 +1408,7 @@ def main() -> int:
     parser.add_argument("--runtime-dir", type=Path, default=Path("runtime"))
     parser.add_argument("--stable-core-dir", type=Path, required=True)
     parser.add_argument("--dev-core-dir", type=Path, required=True)
+    parser.add_argument("--app-dir", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, default=Path("dist"))
     parser.add_argument("--serial", type=int, default=0)
     parser.add_argument("--repository", default=PACK_REPO)
@@ -1104,11 +1421,13 @@ def main() -> int:
     try:
         if args.validate_only:
             validate_runtime_definition(args.runtime_dir, core_dirs)
+            build_definition_sha256(args.app_dir)
             print("稳定版和开发版核心依赖均已被公共运行时覆盖")
             return 0
         manifest = build_pack(
             runtime_dir=args.runtime_dir,
             core_dirs=core_dirs,
+            app_dir=args.app_dir,
             output_dir=args.output_dir,
             serial=args.serial,
             repository=args.repository,
