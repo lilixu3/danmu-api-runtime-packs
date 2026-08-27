@@ -43,10 +43,10 @@ jobs:
           fetch-depth: 1
           persist-credentials: false
 
-      - name: 配置 Node.js 18
+      - name: 配置 Node.js 24
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 18.20.4
+          node-version: 24.19.0
           check-latest: false
 
       - name: 运行构建器测试
@@ -127,10 +127,10 @@ jobs:
             --output-dir dist \
             --serial "${{ steps.state.outputs.serial }}" \
             --repository "$GITHUB_REPOSITORY" \
-            --node-major 18
+            --node-major 24
           test -f dist/node_modules.zip
           jq -e --slurpfile policy runtime/android-runtime-policy.json \
-            '(.schema == 3) and (.runtimeProtocol == 2) and (.nodeMajor == 18) and
+            '(.schema == 3) and (.runtimeProtocol == 2) and (.nodeMajor == 24) and
              (.coreVersions.stable | test("^[0-9]+(\\.[0-9]+)+")) and
              (.coreVersions.dev | test("^[0-9]+(\\.[0-9]+)+")) and
              (.coreCommits.stable | test("^[0-9a-f]{40}$")) and

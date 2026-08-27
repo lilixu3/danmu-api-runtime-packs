@@ -428,7 +428,7 @@ class RuntimePackBuilderTest(unittest.TestCase):
             dependencies = {"opencc-js": "1.4.1"}
             manifest = build_manifest(
                 serial=7,
-                node_major=18,
+                node_major=24,
                 runtime_lock=lock,
                 runtime_policy=policy,
                 dependencies=dependencies,

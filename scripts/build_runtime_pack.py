@@ -22,8 +22,8 @@ from typing import Any, Iterable
 PACK_REPO = "lilixu3/danmu-api-runtime-packs"
 MANIFEST_SCHEMA = 3
 RUNTIME_PROTOCOL = 2
-EMBEDDED_NODE_MAJOR = 18
-EMBEDDED_NODE_VERSION = "18.20.4"
+EMBEDDED_NODE_MAJOR = 24
+EMBEDDED_NODE_VERSION = "24.19.0"
 TRUSTED_CORE_LABELS = ("stable", "dev")
 ANDROID_POLICY_FILE = "android-runtime-policy.json"
 _DISALLOWED_INSTALL_SCRIPTS = {"preinstall", "install", "postinstall"}

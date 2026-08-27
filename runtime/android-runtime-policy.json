@@ -48,6 +48,12 @@
       "ownerPath": "node_modules/@dan-uni/dan-any",
       "ownerVersion": "2.3.9",
       "reason": "Only used by the excluded dan-any PGlite implementation"
+    },
+    "node_modules/web-streams-polyfill": {
+      "version": "3.3.3",
+      "ownerPath": "node_modules/fetch-blob",
+      "ownerVersion": "3.2.0",
+      "reason": "Node >= 16.5 ships native node:stream/web; the fetch-blob fallback branch never runs on the embedded Node 24 runtime"
     }
   },
   "excludedCoreDependencies": {
