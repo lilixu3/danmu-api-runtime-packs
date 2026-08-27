@@ -132,6 +132,16 @@
         "dist/pako_inflate.js",
         "dist/pako_inflate.min.js"
       ]
+    },
+    "node_modules/brotli": {
+      "version": "1.3.3",
+      "files": [
+        "build/encode.js",
+        "build/mem.js",
+        "compress.js",
+        "enc/pre.js",
+        "index.js"
+      ]
     }
   },
   "removedFileSuffixes": [
