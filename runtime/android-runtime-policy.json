@@ -26,7 +26,6 @@
     "node_modules/pako": "2.1.0",
     "node_modules/path-expression-matcher": "1.6.2",
     "node_modules/strnum": "2.4.1",
-    "node_modules/web-streams-polyfill": "3.3.3",
     "node_modules/xml-naming": "0.3.0",
     "node_modules/zod": "4.4.3"
   },
